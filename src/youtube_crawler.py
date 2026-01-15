@@ -1,9 +1,12 @@
 from googleapiclient.discovery import build
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
+import os
 # Cấu hình API
-API_KEY = "AIzaSyC7czQVblYp3xv6SRbEw2J-0xhV1lSBEjk"
-VIDEO_ID = "52NiIC3gJnE" # Thay bằng ID video của bạn
+load_dotenv()
+API_KEY = os.getenv("API_KEY")
+VIDEO_ID = "Ym6h7ZLtdhE" # Thay bằng ID video của bạn
 
 def get_youtube_comments(video_id):
     youtube = build("youtube", "v3", developerKey=API_KEY)
@@ -43,7 +46,7 @@ for c in all_comments[:5]: # In thử 5 comment đầu tiên
     print(f"{c['text']}")
     
 cmt = pd.DataFrame(all_comments)
-cmt.to_csv(f"{VIDEO_ID}.csv")
+cmt.to_csv(f"../data/{VIDEO_ID}_raw.csv")
 
 
 # Labels:
