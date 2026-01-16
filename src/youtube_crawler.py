@@ -36,21 +36,8 @@ def get_youtube_comments():
             next_page_token = response.get("nextPageToken")
             if not next_page_token:
                 break
-        output = pd.DataFrame(comments)
-        output.to_csv(f"../data/{video_id}_raw.csv")
 
-
-
-        with open ("../reports/crawled_videos.json", 'r', encoding="utf-8") as f:
-            report = json.load(f)
-        report[video_id] = {"status": "crawled"}
-        with open ("../reports/crawled_videos.json", 'w', encoding="utf-8" ) as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
-
-        print(f"Tổng số comment lấy được: {len(comments)}")
-        for c in comments[:5]:
-            print(f"{c['text']}")
-        return comments
+        return output(comments, video_id)
     else:
         print("Video đã được cào")
         return 0
@@ -60,6 +47,33 @@ def check_video_id(video_id):
     with open('../reports/crawled_videos.json') as file:
         crawled = json.load(file)
 
-    if video_id in crawled and crawled["QBvL3Ffn1u4"]["status"] == "crawled":
+    if video_id in crawled and crawled[video_id]["status"] == "crawled":
         return False
     return True
+
+
+def output(comments, video_id):
+
+
+    output = pd.DataFrame(comments)
+    output.to_csv(f"../data/raw/{video_id}.csv")
+
+
+
+
+    with open ("../reports/crawled_videos.json", 'r', encoding="utf-8") as f:
+        report = json.load(f)
+    report[video_id] = {"status": "crawled"}
+
+
+
+    with open ("../reports/crawled_videos.json", 'w', encoding="utf-8" ) as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+
+
+
+    print(f"Tổng số comment lấy được: {len(comments)}")
+    for c in comments[:5]:
+        print(f"{c['text']}")
+    return comments
