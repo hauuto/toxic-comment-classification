@@ -1,53 +1,65 @@
 from googleapiclient.discovery import build
-import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 import os
-# Cấu hình API
-load_dotenv()
-API_KEY = os.getenv("API_KEY")
-VIDEO_ID = "QBvL3Ffn1u4" # Thay bằng ID video của bạn
+import json
 
-def get_youtube_comments(video_id):
-    youtube = build("youtube", "v3", developerKey=API_KEY)
+
+
+def get_youtube_comments():
+    video_id = input("Nhập id của video vào đây: ")
+    load_dotenv()
+    youtube = build("youtube", "v3", developerKey=os.getenv("API_KEY"))
     comments = []
     next_page_token = None
 
-    while True:
-        # Gọi API lấy danh sách comment
-        request = youtube.commentThreads().list(
-            part="snippet",
-            videoId=video_id,
-            maxResults=100, # Tối đa 100 comment mỗi lần gọi
-            pageToken=next_page_token,
-            textFormat="plainText"
-        )
-        response = request.execute()
+    if check_video_id(video_id):
+        while True:
+            # Gọi API lấy danh sách comment
+            request = youtube.commentThreads().list(
+                part="snippet",
+                videoId=video_id,
+                maxResults=100, # Tối đa 100 comment mỗi lần gọi
+                pageToken=next_page_token,
+                textFormat="plainText"
+            )
+            response = request.execute()
 
-        # Trích xuất dữ liệu từ JSON
-        for item in response.get("items", []):
-            comment = item["snippet"]["topLevelComment"]["snippet"]
-            comments.append({
-                "text": f"{comment["textDisplay"]}"
-            })
+            # Trích xuất dữ liệu từ JSON
+            for item in response.get("items", []):
+                comment = item["snippet"]["topLevelComment"]["snippet"]
+                comments.append({
+                    "text": f"{comment["textDisplay"]}"
+                })
 
-        # Kiểm tra nếu còn trang tiếp theo
-        next_page_token = response.get("nextPageToken")
-        if not next_page_token:
-            break
-
-    return comments
-
-# Chạy và in kết quả
-all_comments = get_youtube_comments(VIDEO_ID)
-print(f"Tổng số comment lấy được: {len(all_comments)}")
-
-for c in all_comments[:5]: # In thử 5 comment đầu tiên
-    print(f"{c['text']}")
-    
-cmt = pd.DataFrame(all_comments)
-cmt.to_csv(f"../data/{VIDEO_ID}_raw.csv")
+            # Kiểm tra nếu còn trang tiếp theo
+            next_page_token = response.get("nextPageToken")
+            if not next_page_token:
+                break
+        output = pd.DataFrame(comments)
+        output.to_csv(f"../data/{video_id}_raw.csv")
 
 
-# Labels:
-# 
+
+        with open ("../reports/crawled_videos.json", 'r', encoding="utf-8") as f:
+            report = json.load(f)
+        report[video_id] = {"status": "crawled"}
+        with open ("../reports/crawled_videos.json", 'w', encoding="utf-8" ) as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+
+        print(f"Tổng số comment lấy được: {len(comments)}")
+        for c in comments[:5]:
+            print(f"{c['text']}")
+        return comments
+    else:
+        print("Video đã được cào")
+        return 0
+
+
+def check_video_id(video_id):
+    with open('../reports/crawled_videos.json') as file:
+        crawled = json.load(file)
+
+    if video_id in crawled and crawled["QBvL3Ffn1u4"]["status"] == "crawled":
+        return False
+    return True
