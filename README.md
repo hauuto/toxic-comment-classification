@@ -1,4 +1,4 @@
-# comment-classification
+# toxic-comment-classification
 
 Dự án thuộc môn học phần **Xử lý ngôn ngữ tự nhiên**
 
