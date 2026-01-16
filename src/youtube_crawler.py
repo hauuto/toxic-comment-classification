@@ -6,7 +6,7 @@ import os
 # Cấu hình API
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
-VIDEO_ID = "Ym6h7ZLtdhE" # Thay bằng ID video của bạn
+VIDEO_ID = "IzSYlr3VI1A" # Thay bằng ID video của bạn
 
 def get_youtube_comments(video_id):
     youtube = build("youtube", "v3", developerKey=API_KEY)
