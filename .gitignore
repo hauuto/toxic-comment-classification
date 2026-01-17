@@ -208,3 +208,6 @@ __marimo__/
 
 
 .idea/
+data/
+credentials.json
+token.json

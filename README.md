@@ -1,6 +1,6 @@
-# comment-classification
+# toxic-comment-classification
 
-Dự án thuộc môn học Xử lý ngôn ngữ tự nhiên
+Dự án thuộc môn học phần **Xử lý ngôn ngữ tự nhiên**
 
 ## Cách chạy project (Python)
 
