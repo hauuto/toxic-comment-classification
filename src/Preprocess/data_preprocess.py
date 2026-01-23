@@ -12,6 +12,7 @@ from typing import List, Dict, Tuple
 
 # --- 1. CONFIGURATION (CẤU HÌNH) ---
 class Config:
+
     # Cấu hình Java cho VnCoreNLP
     JAVA_HOME = r"C:\Program Files\Java\jdk-21"
     ENCODING = 'utf-8'
