@@ -15,7 +15,9 @@
     "được": [
         "dc",
         "đc",
-        "dk"
+        "dk",
+        "đk",
+        "duoc"
     ],
     "tôi": [
         "t",
@@ -35,7 +37,8 @@
         "ng",
         "n",
         "nng",
-        "ngg"
+        "ngg",
+        "nguoi"
     ],
     "phát triển": [
         "pt"
@@ -83,7 +86,8 @@
     "thích": [
         "thik",
         "thix",
-        "like"
+        "like",
+        "thich"
     ],
     "yêu": [
         "iu"
@@ -95,7 +99,8 @@
         "nt"
     ],
     "rồi": [
-        "r"
+        "r",
+        "rùi"
     ],
     "facebook": [
         "fb",
@@ -114,7 +119,8 @@
     ],
     "quá": [
         "wa",
-        "wá"
+        "wá",
+        "qá"
     ],
     "với": [
         "vs"
@@ -137,7 +143,9 @@
     ],
     "biết": [
         "bit",
-        "bik"
+        "bik",
+        "biet",
+        "bt"
     ],
     "thằng": [
         "thg",
@@ -151,7 +159,8 @@
         "ch"
     ],
     "cũng": [
-        "cx"
+        "cx",
+        "cug"
     ],
     "làm": [
         "lm"
@@ -255,5 +264,124 @@
     ],
     "l": [
         "lon"
+    ],
+    "nhạc": [
+        "nhac"
+    ],
+    "luôn": [
+        "lun",
+        "luon"
+    ],
+    "anh em": [
+        "ae"
+    ],
+    "mới": [
+        "ms"
+    ],
+    "người ta": [
+        "ngta"
+    ],
+    "100 triệu": [
+        "100tr",
+        "100m"
+    ],
+    "200 triệu": [
+        "200m"
+    ],
+    "trước": [
+        "trc"
+    ],
+    "như thế nào": [
+        "ntn"
+    ],
+    "nhiều": [
+        "nhieu"
+    ],
+    "rất": [
+        "rat"
+    ],
+    "đi": [
+        "ik"
+    ],
+    "con mẹ nó rồi": [
+        "cmnr"
+    ],
+    "nữa": [
+        "nx"
+    ],
+    "đẹp": [
+        "dep"
+    ],
+    "nhưng": [
+        "nhưg",
+        "nkưg"
+    ],
+    "xong": [
+        "xog"
+    ],
+    "2 triệu": [
+        "2tr"
+    ],
+    "mà": [
+        "mak"
+    ],
+    "hát": [
+        "hat"
+    ],
+    "nghe": [
+        "nge",
+        "nghhe"
+    ],
+    "nói": [
+        "ns"
+    ],
+    "chúng ta không thuộc về nhau": [
+        "ctktvn"
+    ],
+    "bình luận": [
+        "comment",
+        "cmt"
+    ],
+    "thuộc": [
+        "thuoc"
+    ],
+    "makeup": [
+        "maketup"
+    ],
+    "thường": [
+        "thừong"
+    ],
+    "haizz": [
+        "haizzzzzzzzzzzzzzzx"
+    ],
+    "như thế này": [
+        "ntnày"
+    ],
+    "vẫn": [
+        "zẫn"
+    ],
+    "nhiêu": [
+        "nhjêu"
+    ],
+    "cho lên": [
+        "choleen"
+    ],
+    "Sơn Tùng": [
+        "st"
+    ],
+    "khác": [
+        "khac"
+    ],
+    "nhất": [
+        "nhat"
+    ],
+    "một": [
+        "mot"
+    ],
+    "hương": [
+        "huong"
+    ],
+    "chúc": [
+        "chuc"
     ]
 }
