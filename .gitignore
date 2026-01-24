@@ -211,3 +211,7 @@ __marimo__/
 data/
 credentials.json
 token.json
+
+
+#Crawler chrome profile ignore
+chrome_profile_fixed/
