@@ -7,7 +7,6 @@ import json
 
 
 def get_youtube_comments():
-    video_id = input("Nhập id của video vào đây: ")
     load_dotenv()
     youtube = build("youtube", "v3", developerKey=os.getenv("API_KEY"))
     comments = []
@@ -46,34 +45,19 @@ def get_youtube_comments():
 def check_video_id(video_id):
     with open('../reports/crawled_videos.json') as file:
         crawled = json.load(file)
-
     if video_id in crawled and crawled[video_id]["status"] == "crawled":
         return False
     return True
 
 
 def output(comments, video_id):
-
-
     output = pd.DataFrame(comments)
     output.to_csv(f"../data/raw/{video_id}.csv")
-
-
-
 
     with open ("../reports/crawled_videos.json", 'r', encoding="utf-8") as f:
         report = json.load(f)
     report[video_id] = {"status": "crawled"}
 
-
-
     with open ("../reports/crawled_videos.json", 'w', encoding="utf-8" ) as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
-
-
-
-    print(f"Tổng số comment lấy được: {len(comments)}")
-    for c in comments[:5]:
-        print(f"{c['text']}")
-    return comments
