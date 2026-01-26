@@ -1,0 +1,513 @@
+{
+    "không": [
+        "o",
+        "ko",
+        "k",
+        "kh",
+        "khong",
+        "hem",
+        "hok",
+        "hk",
+        "0",
+        "khum",
+        "hum"
+    ],
+    "được": [
+        "dc",
+        "đc",
+        "dk",
+        "đk",
+        "duoc"
+    ],
+    "tôi": [
+        "t",
+        "tui",
+        "tao"
+    ],
+    "mày": [
+        "m"
+    ],
+    "mình": [
+        "mk",
+        "mik",
+        "mìn",
+        "mih"
+    ],
+    "người": [
+        "ng",
+        "n",
+        "nng",
+        "ngg",
+        "nguoi",
+        "nguoii"
+    ],
+    "phát triển": [
+        "pt"
+    ],
+    "bây giờ": [
+        "bh"
+    ],
+    "trời": [
+        "tr",
+        "trùi",
+        "chài ai"
+    ],
+    "cái lề gì thốn": [
+        "clgt"
+    ],
+    "đéo": [
+        "dell",
+        "đell",
+        "dek",
+        "đếch",
+        "đ"
+    ],
+    "vãi chưởng": [
+        "vc"
+    ],
+    "vãi cả lúa": [
+        "vcl",
+        "vkl",
+        "v.c.l",
+        "vl"
+    ],
+    "giờ": [
+        "h"
+    ],
+    "gì": [
+        "g",
+        "j"
+    ],
+    "vậy": [
+        "z",
+        "zậy",
+        "v",
+        "vâị"
+    ],
+    "thích": [
+        "thik",
+        "thix",
+        "like",
+        "thich"
+    ],
+    "yêu": [
+        "iu"
+    ],
+    "đồng ý": [
+        "add"
+    ],
+    "nhắn tin": [
+        "nt"
+    ],
+    "rồi": [
+        "r",
+        "rùi",
+        "rồj"
+    ],
+    "facebook": [
+        "fb",
+        "face"
+    ],
+    "hà nội": [
+        "hn"
+    ],
+    "sài gòn": [
+        "sg"
+    ],
+    "ừ": [
+        "uk",
+        "uh",
+        "uhm"
+    ],
+    "quá": [
+        "wa",
+        "wá",
+        "qá"
+    ],
+    "với": [
+        "vs"
+    ],
+    "việt nam": [
+        "vn"
+    ],
+    "hiểu": [
+        "hiu",
+        "hỉu"
+    ],
+    "buồn": [
+        "bun"
+    ],
+    "thôi": [
+        "thui",
+        "th"
+    ],
+    "nhé": [
+        "nha"
+    ],
+    "biết": [
+        "bit",
+        "bik",
+        "biet",
+        "bt"
+    ],
+    "thằng": [
+        "thg",
+        "thk"
+    ],
+    "bạn": [
+        "b",
+        "bn"
+    ],
+    "chưa": [
+        "ch"
+    ],
+    "cũng": [
+        "cx",
+        "cug",
+        "cũg"
+    ],
+    "làm": [
+        "lm"
+    ],
+    "xã hội": [
+        "xh"
+    ],
+    "con": [
+        "cn"
+    ],
+    "anh": [
+        "a",
+        "ah"
+    ],
+    "em": [
+        "e"
+    ],
+    "chị": [
+        "c",
+        "cj"
+    ],
+    "mọi người": [
+        "mn",
+        "mng"
+    ],
+    "xàm": [
+        "tung tung tung sahur"
+    ],
+    "hôm nay": [
+        "hnay"
+    ],
+    "địt": [
+        "djt",
+        "đệch",
+        "đụ",
+        "đjt",
+        "địt's",
+        "lịt"
+    ],
+    "mẹ": [
+        "má",
+        "mạ",
+        "moẹ",
+        "mịa",
+        "mịe"
+    ],
+    "đụ má": [
+        "duma",
+        "dume",
+        "đạ mú",
+        "da mu"
+    ],
+    "bố": [
+        "ba",
+        "tía"
+    ],
+    "đại học": [
+        "ĐH"
+    ],
+    "mệt": [
+        "mợt"
+    ],
+    "yếu": [
+        "íu"
+    ],
+    "chúng ta": [
+        "cta"
+    ],
+    "lượt xem": [
+        "view"
+    ],
+    "tim": [
+        "tym",
+        "<3"
+    ],
+    "dễ": [
+        "ez"
+    ],
+    "không thích": [
+        "dislike"
+    ],
+    "lời bài hát": [
+        "lyrics",
+        "lyric",
+        "liric"
+    ],
+    "Đờ mờ": [
+        "đm",
+        "dm"
+    ],
+    "Xin lỗi": [
+        "sorry",
+        "xl"
+    ],
+    "cờ cờ": [
+        "cc"
+    ],
+    "Đẹp trai": [
+        "depzai"
+    ],
+    "điện thoại": [
+        "đt"
+    ],
+    "đầu buồi": [
+        "đb"
+    ],
+    "l": [
+        "lon",
+        "loz",
+        "lol",
+        "lồn"
+    ],
+    "nhạc": [
+        "nhac"
+    ],
+    "luôn": [
+        "lun",
+        "luon"
+    ],
+    "anh em": [
+        "ae"
+    ],
+    "mới": [
+        "ms"
+    ],
+    "người ta": [
+        "ngta"
+    ],
+    "100 triệu": [
+        "100tr",
+        "100m"
+    ],
+    "200 triệu": [
+        "200m"
+    ],
+    "trước": [
+        "trc"
+    ],
+    "như thế nào": [
+        "ntn"
+    ],
+    "nhiều": [
+        "nhieu"
+    ],
+    "rất": [
+        "rat"
+    ],
+    "đi": [
+        "ik"
+    ],
+    "con mẹ nó rồi": [
+        "cmnr"
+    ],
+    "nữa": [
+        "nx",
+        "nũa"
+    ],
+    "đẹp": [
+        "dep"
+    ],
+    "nhưng": [
+        "nhưg",
+        "nkưg"
+    ],
+    "xong": [
+        "xog"
+    ],
+    "2 triệu": [
+        "2tr"
+    ],
+    "mà": [
+        "mak"
+    ],
+    "hát": [
+        "hat"
+    ],
+    "nghe": [
+        "nge",
+        "nghhe"
+    ],
+    "nói": [
+        "ns"
+    ],
+    "chúng ta không thuộc về nhau": [
+        "ctktvn"
+    ],
+    "bình luận": [
+        "comment",
+        "cmt"
+    ],
+    "thuộc": [
+        "thuoc"
+    ],
+    "makeup": [
+        "maketup"
+    ],
+    "thường": [
+        "thừong"
+    ],
+    "haizz": [
+        "haizzzzzzzzzzzzzzzx"
+    ],
+    "như thế này": [
+        "ntnày"
+    ],
+    "vẫn": [
+        "zẫn"
+    ],
+    "nhiêu": [
+        "nhjêu"
+    ],
+    "cho lên": [
+        "choleen"
+    ],
+    "Sơn Tùng": [
+        "st"
+    ],
+    "khác": [
+        "khac"
+    ],
+    "nhất": [
+        "nhat"
+    ],
+    "một": [
+        "mot"
+    ],
+    "hương": [
+        "huong"
+    ],
+    "chúc": [
+        "chuc"
+    ],
+    "chịu": [
+        "chiệu"
+    ],
+    "lương": [
+        "luong"
+    ],
+    "viên": [
+        "vien"
+    ],
+    "nghiệp": [
+        "nghiep"
+    ],
+    "bốc": [
+        "boc"
+    ],
+    "phốt": [
+        "phot"
+    ],
+    "nước": [
+        "nc"
+    ],
+    "sườn": [
+        "suon"
+    ],
+    "việt": [
+        "viet"
+    ],
+    "giống": [
+        "giốg"
+    ],
+    "phải": [
+        "fai"
+    ],
+    "gắng": [
+        "gắg"
+    ],
+    "dislike": [
+        "disslike",
+        "địtlike",
+        "địtlai",
+        "địtsliek",
+        "dịtslike"
+    ],
+    "lượt": [
+        "luot"
+    ],
+    "giùm": [
+        "dùm"
+    ],
+    "Trung Quốc": [
+        "tq"
+    ],
+    "bất động sản": [
+        "bđs"
+    ],
+    "vô": [
+        "zô"
+    ],
+    "đang": [
+        "đag"
+    ],
+    "ghê": [
+        "gê"
+    ],
+    "người yêu": [
+        "ny"
+    ],
+    "vợ": [
+        "vk"
+    ],
+    "ơi": [
+        "oy"
+    ],
+    "vịt": [
+        "zịt",
+        "vịtttt"
+    ],
+    "mister vịt": [
+        "mistervịt"
+    ],
+    "shit": [
+        "siịt"
+    ],
+    "em bé": [
+        "embes"
+    ],
+    "2 vợ chồng": [
+        "2vc"
+    ],
+    "liên quan": [
+        "lquan"
+    ],
+    "đờ mờ mờ": [
+        "dmm"
+    ],
+    "bede": [
+        "bd"
+    ],
+    "cùng": [
+        "cùg"
+    ],
+    "sắc": [
+        "sac"
+    ],
+    "cỡ": [
+        "cở"
+    ],
+    "quen": [
+        "wen"
+    ],
+    "nói chung": [
+        "nchung"
+    ]
+}
