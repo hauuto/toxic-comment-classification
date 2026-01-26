@@ -7,7 +7,7 @@ from googleapiclient.http import MediaFileUpload
 import io
 from googleapiclient.http import MediaIoBaseDownload
 # --- CAU HINH ---
-# Ban can file credentials.json (tai tu Cloud Console chon OAuth Client ID)
+# Ban can file c.redentials.json (tai tu Cloud Console chon OAuth Client ID)
 CREDENTIALS_FILE = '../credentials.json'
 TOKEN_FILE = '../token.json'
 # ID folder 'data' tren Drive

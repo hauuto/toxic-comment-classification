@@ -1,0 +1,34 @@
+{
+    "heart": {
+        "base": "<3",
+        "char": "3",
+        "patterns": [
+            "<3+"
+        ],
+        "max_repeat": 3
+    },
+    "smile_colon": {
+        "base": ":)",
+        "char": ")",
+        "patterns": [
+            ":\\)+"
+        ],
+        "max_repeat": 2
+    },
+    "smile_equal": {
+        "base": "=)",
+        "char": ")",
+        "patterns": [
+            "=\\)+"
+        ],
+        "max_repeat": 2
+    },
+    "sad": {
+        "base": ":(",
+        "char": "(",
+        "patterns": [
+            ":\\(+"
+        ],
+        "max_repeat": 2
+    }
+}
