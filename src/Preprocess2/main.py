@@ -3,7 +3,7 @@ from Filters.english_filter import EnglishFilter
 from Filters.short_text_filter import ShortTextFilter
 from Decoders.teencode_decoder import TeencodeConverter
 from Decoders.repetition_decoder import RepetitionDecoder
-from Filters.link_filter import LinkFilter
+from src.Preprocess2.Decoders.link_filter import LinkFilter
 from Decoders.vncorenlp_decoder import VnCoreNLPDecoder
 from Normalizers.vietnamese_typing_normalizer import VietnameseTypingNormalizer
 import pandas as pd
