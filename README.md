@@ -24,3 +24,5 @@ poetry show
 ```
 poetry add <dependency_name>
 ```
+
+#### Reference: https://python-poetry.org/docs/basic-usage/
