@@ -1,56 +1,48 @@
-import langdetect
 import pandas as pd
-from langdetect import LangDetectException
+from langdetect import detect_langs, DetectorFactory, LangDetectException
+
 
 class EnglishFilter:
     def __init__(self):
-        langdetect.DetectorFactory.seed = 0
+        # đảm bảo kết quả langdetect deterministic
+        DetectorFactory.seed = 0
 
-    def getViChance(self, text: str):
-        try:
-            text = str(text)
-            if not text.strip():
-                return 0.0
-                
-            res = langdetect.detect_langs(text)
-            for i in res:
-                if i.lang == 'vi':
-                    return i.prob
-            return 0.0
-        except LangDetectException:
-            return 0.0
+    def analyze(self, text: str):
+        """
+        Phân tích 1 text:
+        - Trả về (is_vi: bool, vi_chance: float)
+        - Chỉ gọi langdetect 1 lần
+        """
+        if not isinstance(text, str) or not text.strip():
+            return False, 0.0
 
-    def isVi(self, text: str):
         try:
-            text = str(text)
-            if not text.strip():
-                return False
-            return langdetect.detect(text) == 'vi'
+            res = detect_langs(text)
+            for r in res:
+                if r.lang == "vi":
+                    return True, r.prob
+            return False, 0.0
         except LangDetectException:
-            return False
-    
+            return False, 0.0
+
     def filt(self, df: pd.DataFrame, text_col: str):
+        """
+        Lọc DataFrame, chỉ giữ lại comment tiếng Việt
+        Thêm cột: vi_chance
+        """
         old_cnt = len(df)
-        
-        texts = df[text_col].values
-        
-        keep_mask = []   
-        vi_chances = []  
-        
-        for text in texts:
-            is_vietnamese = self.isVi(text)
-            
-            if is_vietnamese:
-                keep_mask.append(True)
-                vi_chances.append(self.getViChance(text))
-            else:
-                keep_mask.append(False)
-        
-        result_df = df[keep_mask].copy()
-        result_df['vi_chance'] = vi_chances
-        result_df['is_vi'] = True 
-        
-        cur_cnt = len(result_df)
-        print(f'Còn lại {cur_cnt}/{old_cnt} sau EnglishFilter')
-        
+
+        mask = []
+        chances = []
+
+        for text in df[text_col]:
+            is_vi, chance = self.analyze(text)
+            mask.append(is_vi)
+            if is_vi:
+                chances.append(chance)
+
+        result_df = df.loc[mask].copy()
+        result_df["vi_chance"] = chances
+
+        print(f"Còn lại {len(result_df)}/{old_cnt} sau EnglishFilter")
         return result_df
