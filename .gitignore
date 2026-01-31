@@ -215,3 +215,7 @@ token.json
 
 #Crawler chrome profile ignore
 chrome_profile_fixed/
+
+
+
+*.csv
