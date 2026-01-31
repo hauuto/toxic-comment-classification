@@ -115,7 +115,7 @@ class VOZCrawler:
         clean_keyword = text.replace(' ', '_')
 
         filename = f"{clean_keyword}_{self.max_threads}_{self.max_pages}.csv"
-        output_dir = os.path.join(os.pardir, "data", "raw", "voz")
+        output_dir = os.path.join(os.pardir, "data", "raw")
         os.makedirs(output_dir, exist_ok=True)
         return os.path.join(output_dir, filename)
 
