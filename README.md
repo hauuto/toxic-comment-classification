@@ -4,16 +4,23 @@ Dự án thuộc môn học phần **Xử lý ngôn ngữ tự nhiên**
 
 ## Cách chạy project (Python)
 
-### 1\) Tạo \& kích hoạt `venv`
-Tạo môi trường ảo:
-- `python -m venv venv`
+### Cài đặt Poetry (nếu chưa có)
+```
+pip install poetry
+```
 
-Kích hoạt:
-- PowerShell: `.\venv\Scripts\Activate.ps1`
-- CMD: `.\venv\Scripts\activate.bat`
+### Cài đặt venv và dependency
+```
+poetry install
+```
 
-### 2\) Cài đặt thư viện từ `requirements.txt`
-- `pip install -r requirements.txt`
+### Kiểm tra Poetry
+```
+poetry env info
+poetry show
+```
 
-### 3\) (Tuỳ chọn) Thoát `venv`
-- `deactivate`
+### Thêm dependency
+```
+poetry add <dependency_name>
+```
