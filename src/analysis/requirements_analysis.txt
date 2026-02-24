@@ -1,8 +1,0 @@
-# Requirements cho data analysis report
-pandas>=1.3.0
-numpy>=1.21.0
-matplotlib>=3.5.0
-seaborn>=0.11.0
-pathlib
-collections
-re

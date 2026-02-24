@@ -1,10 +1,8 @@
-import os
-import csv
 import time
-import threading
 from playwright.sync_api import sync_playwright
 
 from nlp_pipeline import VietnameseCommentPreprocessor
+from youtube_crawler import extract_youtube_comments
 
 def _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback):
     log("Đợi trang ổn định...")
@@ -135,117 +133,6 @@ def _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocesso
             break
             
         page.mouse.wheel(0, 3000)
-        time.sleep(2)
-    return current_id
-
-def _extract_youtube(page, log, current_id, seen_texts, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback):
-    log("Đợi trang ổn định YouTube...")
-    time.sleep(5)
-    
-    # Scroll multiple times to trigger the lazy-loaded comments section
-    try:
-        page.evaluate("window.scrollBy(0, 600)")
-        time.sleep(2)
-        page.evaluate("window.scrollBy(0, 600)")
-    except Exception:
-        pass
-    time.sleep(3)
-    
-    log("Bắt đầu quét dữ liệu YouTube...")
-    max_empty_scrolls = 5
-    empty_scrolls = 0
-    
-    while True:
-        if stop_event and stop_event.is_set():
-            return current_id
-            
-        # Expand replies
-        try:
-            # YouTube "x phản hồi" button
-            expander_btns = page.locator('ytd-button-renderer#more-replies button, span:has-text("phản hồi"), span:has-text("replies"), button[aria-label*="phản hồi"], button[aria-label*="replies"]')
-            for i in range(expander_btns.count()):
-                try:
-                    if expander_btns.nth(i).is_visible():
-                        expander_btns.nth(i).click(timeout=1000)
-                        time.sleep(0.5)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-            
-        # Expand "Read more" (long comments)
-        try:
-            read_more_btns = page.locator('ytd-comment-view-model button#more, ytd-comment-view-model span:has-text("Đọc thêm"), ytd-comment-view-model span:has-text("Read more")')
-            for i in range(read_more_btns.count()):
-                try:
-                    if read_more_btns.nth(i).is_visible():
-                        read_more_btns.nth(i).click(timeout=1000)
-                        time.sleep(0.5)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-            
-        time.sleep(2)
-        
-        # Scroll further to ensure comments render
-        page.keyboard.press("PageDown")
-        page.keyboard.press("PageDown")
-        time.sleep(2)
-        
-        # JS to replace img alt tags for emojis in yt-formatted-string
-        replace_emoji_js = r"""
-            const images = document.querySelectorAll('ytd-comment-view-model img.yt-core-image, yt-formatted-string#content-text img.yt-core-image');
-            images.forEach(img => {
-                if (img.alt) {
-                    const textNode = document.createTextNode(img.alt);
-                    img.parentNode.replaceChild(textNode, img);
-                }
-            });
-        """
-        try:
-            page.evaluate(replace_emoji_js)
-        except Exception:
-            pass
-        
-        # Use a broader locator for Modern YouTube
-        comment_blocks = page.locator('ytd-comment-view-model #content-text, yt-formatted-string#content-text')
-        count = comment_blocks.count()
-        new_batch = []
-        
-        for i in range(count):
-            try:
-                full_text = comment_blocks.nth(i).text_content().strip()
-                if not full_text: continue
-                if len(full_text) < 2 and full_text not in ['Ok', 'Dạ']: continue
-                
-                if preprocessor:
-                    processed = preprocessor.process_comment(full_text, use_decoder=use_decoder, use_filter=use_filter, use_normalizer=use_normalizer, use_segmentor=use_segmentor)
-                    if not processed["is_valid"]: continue
-                    clean_text = processed["cleaned_text"]
-                else:
-                    clean_text = full_text
-                    
-                if clean_text not in seen_texts:
-                    seen_texts.add(clean_text)
-                    item = {'id': current_id, 'text': clean_text}
-                    new_batch.append(item)
-                    extracted_data.append(item)
-                    current_id += 1
-            except Exception:
-                pass
-                
-        if new_batch:
-            if data_callback: data_callback(new_batch)
-            log(f"Đã quét thêm {len(new_batch)} bình luận (Tổng YouTube: {len(seen_texts)})...")
-            empty_scrolls = 0
-        else:
-            empty_scrolls += 1
-            
-        if empty_scrolls >= max_empty_scrolls:
-            break
-            
-        page.mouse.wheel(0, 2000)
         time.sleep(2)
     return current_id
 
@@ -492,6 +379,28 @@ def extract_comments_stream(url_input: str, headless: bool = False,
                     break
                     
                 log(f"--- Bắt đầu xử lý URL: {url} ---")
+
+                url_lower = url.lower()
+
+                # YouTube: use API directly (no Playwright page needed)
+                if "youtube.com" in url_lower or "youtu.be" in url_lower:
+                    current_id = extract_youtube_comments(
+                        url,
+                        log_callback=log,
+                        data_callback=data_callback,
+                        stop_event=stop_event,
+                        preprocessor=preprocessor,
+                        use_decoder=use_decoder,
+                        use_filter=use_filter,
+                        use_normalizer=use_normalizer,
+                        use_segmentor=use_segmentor,
+                        current_id=current_id,
+                        seen_texts=seen_texts,
+                        extracted_data=extracted_data,
+                    )
+                    log(f"--- Hoàn tất trang {url} ---")
+                    continue
+
                 page = context.new_page()
                 
                 try:
@@ -503,11 +412,8 @@ def extract_comments_stream(url_input: str, headless: bool = False,
                 
                 try:
                     # Auto-detect platform
-                    url_lower = url.lower()
                     if "facebook.com" in url_lower or "fb.com" in url_lower or "fb.watch" in url_lower:
                         current_id = _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback)
-                    elif "youtube.com" in url_lower or "youtu.be" in url_lower:
-                        current_id = _extract_youtube(page, log, current_id, seen_texts, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback)
                     elif "tiktok.com" in url_lower:
                         current_id = _extract_tiktok(page, log, current_id, seen_texts, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback)
                     elif "threads.net" in url_lower or "threads.com" in url_lower:

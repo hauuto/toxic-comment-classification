@@ -9,6 +9,10 @@ import customtkinter as ctk
 from tkinter import messagebox, ttk
 
 from crawler import extract_comments_stream
+from keyword_crawler import VOZCrawler, ThreadsCrawler
+from warehouse import append_to_warehouse, get_warehouse_count
+from keyword_history import load_history as load_kw_history
+from nlp_pipeline import VietnameseCommentPreprocessor
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
@@ -32,10 +36,12 @@ class App(ctk.CTk):
         self.tabview.pack(fill="both", expand=True, padx=20, pady=10)
 
         self.tab_crawler = self.tabview.add("Facebook Crawler")
+        self.tab_keyword = self.tabview.add("Keyword Crawler")
         self.tab_files = self.tabview.add("File Manager")
         self.tab_config = self.tabview.add("Config Manager")
 
         self._setup_crawler_tab()
+        self._setup_keyword_crawler_tab()
         self._setup_file_manager_tab()
         self._setup_config_tab()
 
@@ -127,7 +133,347 @@ class App(ctk.CTk):
         self.status_label.grid(row=3, column=0, pady=5, sticky="w", padx=10)
 
     # ---------------------------------------------------------
-    # TAB 2: FILE MANAGER
+    # TAB 2: KEYWORD CRAWLER (VOZ / Threads)
+    # ---------------------------------------------------------
+    def _setup_keyword_crawler_tab(self):
+        tab = self.tab_keyword
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(2, weight=1)
+
+        # --- Top input frame ---
+        input_frame = ctk.CTkFrame(tab)
+        input_frame.grid(row=0, column=0, padx=10, pady=5, sticky="ew")
+        input_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(input_frame, text="Keyword:").grid(row=0, column=0, padx=10, pady=10)
+        self.kw_entry = ctk.CTkEntry(input_frame, placeholder_text="Nhập từ khóa cần cào...")
+        self.kw_entry.grid(row=0, column=1, padx=(0, 10), pady=10, sticky="ew")
+
+        ctk.CTkLabel(input_frame, text="Platform:").grid(row=0, column=2, padx=(10, 5), pady=10)
+        self.kw_platform_var = ctk.StringVar(value="VOZ")
+        self.kw_platform_menu = ctk.CTkOptionMenu(
+            input_frame, values=["VOZ", "Threads"],
+            variable=self.kw_platform_var, command=self._on_kw_platform_change, width=120
+        )
+        self.kw_platform_menu.grid(row=0, column=3, padx=(0, 10), pady=10)
+
+        # --- Parameters row ---
+        param_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
+        param_frame.grid(row=1, column=0, columnspan=4, padx=10, pady=5, sticky="w")
+
+        # VOZ params
+        self.kw_voz_frame = ctk.CTkFrame(param_frame, fg_color="transparent")
+        ctk.CTkLabel(self.kw_voz_frame, text="Max Threads:").pack(side="left", padx=(0, 5))
+        self.kw_max_threads_var = ctk.StringVar(value="10")
+        ctk.CTkEntry(self.kw_voz_frame, textvariable=self.kw_max_threads_var, width=60).pack(side="left", padx=(0, 15))
+        ctk.CTkLabel(self.kw_voz_frame, text="Max Pages:").pack(side="left", padx=(0, 5))
+        self.kw_max_pages_var = ctk.StringVar(value="50")
+        ctk.CTkEntry(self.kw_voz_frame, textvariable=self.kw_max_pages_var, width=60).pack(side="left", padx=(0, 15))
+
+        # Threads params
+        self.kw_threads_frame = ctk.CTkFrame(param_frame, fg_color="transparent")
+        ctk.CTkLabel(self.kw_threads_frame, text="Max Posts:").pack(side="left", padx=(0, 5))
+        self.kw_max_posts_var = ctk.StringVar(value="10")
+        ctk.CTkEntry(self.kw_threads_frame, textvariable=self.kw_max_posts_var, width=60).pack(side="left", padx=(0, 15))
+        ctk.CTkLabel(self.kw_threads_frame, text="Max Scroll:").pack(side="left", padx=(0, 5))
+        self.kw_max_scroll_var = ctk.StringVar(value="30")
+        ctk.CTkEntry(self.kw_threads_frame, textvariable=self.kw_max_scroll_var, width=60).pack(side="left", padx=(0, 15))
+
+        # Show VOZ params by default
+        self.kw_voz_frame.pack(side="left")
+
+        # NLP toggles
+        nlp_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
+        nlp_frame.grid(row=2, column=0, columnspan=4, padx=10, pady=5, sticky="w")
+        ctk.CTkLabel(nlp_frame, text="Tiền Xử Lý:").pack(side="left", padx=(0, 10))
+
+        self.kw_dec_var = ctk.BooleanVar(value=True)
+        self.kw_fil_var = ctk.BooleanVar(value=True)
+        self.kw_nor_var = ctk.BooleanVar(value=True)
+        self.kw_seg_var = ctk.BooleanVar(value=True)
+
+        self.kw_chk_dec = ctk.CTkCheckBox(nlp_frame, text="Decoder", variable=self.kw_dec_var)
+        self.kw_chk_dec.pack(side="left", padx=5)
+        self.kw_chk_fil = ctk.CTkCheckBox(nlp_frame, text="Filter", variable=self.kw_fil_var)
+        self.kw_chk_fil.pack(side="left", padx=5)
+        self.kw_chk_nor = ctk.CTkCheckBox(nlp_frame, text="Normalizer", variable=self.kw_nor_var)
+        self.kw_chk_nor.pack(side="left", padx=5)
+        self.kw_chk_seg = ctk.CTkCheckBox(nlp_frame, text="VnCoreNLP Segmentor", variable=self.kw_seg_var)
+        self.kw_chk_seg.pack(side="left", padx=5)
+
+        # Buttons
+        btn_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
+        btn_frame.grid(row=3, column=0, columnspan=4, pady=10)
+
+        self.kw_run_button = ctk.CTkButton(btn_frame, text="Bắt Đầu", command=self.start_keyword_crawling)
+        self.kw_run_button.pack(side="left", padx=10)
+        self.kw_stop_button = ctk.CTkButton(btn_frame, text="Dừng", command=self.stop_keyword_crawling,
+                                             state="disabled", fg_color="red", hover_color="darkred")
+        self.kw_stop_button.pack(side="left", padx=10)
+
+        # --- Main workspace: Log + Table + History ---
+        work_frame = ctk.CTkFrame(tab)
+        work_frame.grid(row=2, column=0, padx=10, pady=5, sticky="nsew")
+        work_frame.grid_columnconfigure(0, weight=1)
+        work_frame.grid_columnconfigure(1, weight=3)
+        work_frame.grid_columnconfigure(2, weight=1)
+        work_frame.grid_rowconfigure(0, weight=1)
+
+        # Log textbox (left)
+        self.kw_log_textbox = ctk.CTkTextbox(work_frame, corner_radius=5)
+        self.kw_log_textbox.grid(row=0, column=0, padx=(5, 5), pady=5, sticky="nsew")
+        self.kw_log_textbox.insert("0.0", "Hệ thống Keyword Crawler sẵn sàng.\n")
+        self.kw_log_textbox.configure(state="disabled")
+
+        # Data table (center)
+        table_frame = ctk.CTkFrame(work_frame, fg_color="transparent")
+        table_frame.grid(row=0, column=1, padx=(5, 5), pady=5, sticky="nsew")
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+
+        kw_columns = ("id", "text")
+        self.kw_tree_data = ttk.Treeview(table_frame, columns=kw_columns, show="headings")
+        self.kw_tree_data.heading("id", text="ID")
+        self.kw_tree_data.heading("text", text="Nội dung bình luận")
+        self.kw_tree_data.column("id", width=50, anchor="center")
+        self.kw_tree_data.column("text", width=400, anchor="w")
+        kw_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.kw_tree_data.yview)
+        self.kw_tree_data.configure(yscrollcommand=kw_scroll.set)
+        self.kw_tree_data.grid(row=0, column=0, sticky="nsew")
+        kw_scroll.grid(row=0, column=1, sticky="ns")
+
+        # History panel (right)
+        history_frame = ctk.CTkFrame(work_frame)
+        history_frame.grid(row=0, column=2, padx=(5, 5), pady=5, sticky="nsew")
+        history_frame.grid_rowconfigure(1, weight=1)
+        history_frame.grid_columnconfigure(0, weight=1)
+
+        hist_header = ctk.CTkFrame(history_frame, fg_color="transparent")
+        hist_header.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+        ctk.CTkLabel(hist_header, text="Lịch sử Keyword", font=("Arial", 13, "bold")).pack(side="left")
+        ctk.CTkButton(hist_header, text="⟳", width=30, command=self.refresh_keyword_history).pack(side="right", padx=2)
+        ctk.CTkButton(hist_header, text="Cào lại", width=60, command=self._reuse_history_keyword).pack(side="right", padx=2)
+
+        hist_tree_frame = ctk.CTkFrame(history_frame, fg_color="transparent")
+        hist_tree_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
+        hist_tree_frame.grid_rowconfigure(0, weight=1)
+        hist_tree_frame.grid_columnconfigure(0, weight=1)
+
+        self.kw_history_tree = ttk.Treeview(hist_tree_frame, columns=("platform", "keyword"), show="headings", height=10)
+        self.kw_history_tree.heading("platform", text="Platform")
+        self.kw_history_tree.heading("keyword", text="Keyword")
+        self.kw_history_tree.column("platform", width=70, anchor="center")
+        self.kw_history_tree.column("keyword", width=130, anchor="w")
+        hist_scroll = ttk.Scrollbar(hist_tree_frame, orient="vertical", command=self.kw_history_tree.yview)
+        self.kw_history_tree.configure(yscrollcommand=hist_scroll.set)
+        self.kw_history_tree.grid(row=0, column=0, sticky="nsew")
+        hist_scroll.grid(row=0, column=1, sticky="ns")
+
+        # Status
+        self.kw_status_label = ctk.CTkLabel(tab, text="Trạng thái: Đang chờ lệnh", text_color="gray")
+        self.kw_status_label.grid(row=3, column=0, pady=5, sticky="w", padx=10)
+
+        # State variables
+        self.kw_is_running = False
+        self.kw_stop_event = threading.Event()
+        self.kw_extracted_data = []
+        self.kw_active_crawler = None  # reference to close on stop
+
+        # Initial history load
+        self.refresh_keyword_history()
+
+    def _on_kw_platform_change(self, platform):
+        if platform == "VOZ":
+            self.kw_threads_frame.pack_forget()
+            self.kw_voz_frame.pack(side="left")
+        else:
+            self.kw_voz_frame.pack_forget()
+            self.kw_threads_frame.pack(side="left")
+
+    def refresh_keyword_history(self):
+        for item in self.kw_history_tree.get_children():
+            self.kw_history_tree.delete(item)
+        try:
+            history = load_kw_history()
+            for platform in ["voz", "threads"]:
+                for kw in history.get(platform, []):
+                    self.kw_history_tree.insert("", "end", values=(platform.upper(), kw))
+        except Exception:
+            pass
+
+    def _reuse_history_keyword(self):
+        selected = self.kw_history_tree.selection()
+        if not selected:
+            messagebox.showwarning("Nhắc nhở", "Hãy chọn 1 keyword từ lịch sử.")
+            return
+        item = self.kw_history_tree.item(selected[0])
+        platform = item["values"][0]
+        keyword = item["values"][1]
+        self.kw_entry.delete(0, "end")
+        self.kw_entry.insert(0, keyword)
+        self.kw_platform_var.set(platform)
+        self._on_kw_platform_change(platform)
+
+    def kw_log_message(self, message):
+        self.kw_log_textbox.configure(state="normal")
+        self.kw_log_textbox.insert("end", f"{message}\n")
+        self.kw_log_textbox.see("end")
+        self.kw_log_textbox.configure(state="disabled")
+
+    def kw_handle_new_data(self, batch):
+        """Called from crawler thread – schedule GUI update."""
+        self.after(0, self._kw_append_to_table, batch)
+        self.kw_extracted_data.extend(batch)
+
+    def _kw_append_to_table(self, batch):
+        for item in batch:
+            display_text = str(item.get("text", "")).replace("\n", "  ")
+            self.kw_tree_data.insert("", "end", values=(item.get("id", ""), display_text))
+        if len(self.kw_tree_data.get_children()) > 0:
+            self.kw_tree_data.yview_moveto(1)
+        wh_count = get_warehouse_count()
+        self.kw_status_label.configure(
+            text=f"Thu thập: {len(self.kw_extracted_data)} | Warehouse: {wh_count} dòng",
+            text_color="green"
+        )
+
+    def _set_kw_gui_state(self, running):
+        if running:
+            self.kw_run_button.configure(state="disabled", text="Đang chạy...")
+            self.kw_stop_button.configure(state="normal")
+            self.kw_entry.configure(state="disabled")
+            self.kw_platform_menu.configure(state="disabled")
+            self.kw_chk_dec.configure(state="disabled")
+            self.kw_chk_fil.configure(state="disabled")
+            self.kw_chk_nor.configure(state="disabled")
+            self.kw_chk_seg.configure(state="disabled")
+            self.kw_is_running = True
+        else:
+            self.kw_run_button.configure(state="normal", text="Bắt Đầu")
+            self.kw_stop_button.configure(state="disabled", text="Dừng")
+            self.kw_entry.configure(state="normal")
+            self.kw_platform_menu.configure(state="normal")
+            self.kw_chk_dec.configure(state="normal")
+            self.kw_chk_fil.configure(state="normal")
+            self.kw_chk_nor.configure(state="normal")
+            self.kw_chk_seg.configure(state="normal")
+            self.kw_is_running = False
+            self.refresh_file_list()
+            self.refresh_keyword_history()
+
+    def _keyword_crawl_thread(self, keyword, platform, u_dec, u_fil, u_nor, u_seg,
+                               max_threads, max_pages, max_posts, max_scroll):
+        crawler = None
+        try:
+            # Init NLP preprocessor
+            preprocessor = None
+            if u_dec or u_fil or u_nor or u_seg:
+                self.after(0, self.kw_log_message, "Đang khởi tạo bộ tiền xử lý NLP...")
+                preprocessor = VietnameseCommentPreprocessor()
+
+            if platform == "VOZ":
+                crawler = VOZCrawler(
+                    keyword=keyword,
+                    max_threads=max_threads,
+                    max_pages=max_pages,
+                    log_callback=lambda msg: self.after(0, self.kw_log_message, msg),
+                    stop_event=self.kw_stop_event,
+                    data_callback=self.kw_handle_new_data,
+                    preprocessor=preprocessor,
+                    use_decoder=u_dec,
+                    use_filter=u_fil,
+                    use_normalizer=u_nor,
+                    use_segmentor=u_seg,
+                )
+            else:
+                crawler = ThreadsCrawler(
+                    keyword=keyword,
+                    max_posts=max_posts,
+                    max_scroll=max_scroll,
+                    log_callback=lambda msg: self.after(0, self.kw_log_message, msg),
+                    stop_event=self.kw_stop_event,
+                    data_callback=self.kw_handle_new_data,
+                    preprocessor=preprocessor,
+                    use_decoder=u_dec,
+                    use_filter=u_fil,
+                    use_normalizer=u_nor,
+                    use_segmentor=u_seg,
+                )
+
+            self.kw_active_crawler = crawler
+            crawler.crawl_keyword(keyword)
+            self.after(0, self.kw_log_message, f"--- HOÀN TẤT. Tổng {len(self.kw_extracted_data)} bình luận. ---")
+        except Exception as e:
+            self.after(0, self.kw_log_message, f"Lỗi không xác định: {str(e)}")
+        finally:
+            if crawler:
+                try:
+                    crawler.close()
+                except Exception:
+                    pass
+            self.kw_active_crawler = None
+            self.after(0, self._set_kw_gui_state, False)
+
+    def start_keyword_crawling(self):
+        if self.kw_is_running:
+            return
+        keyword = self.kw_entry.get().strip()
+        if not keyword:
+            messagebox.showwarning("Lỗi", "Vui lòng nhập keyword!")
+            return
+
+        platform = self.kw_platform_var.get()
+
+        # Check if keyword already in history – warn but allow
+        history = load_kw_history()
+        platform_key = platform.lower()
+        kw_already_crawled = keyword in history.get(platform_key, [])
+
+        u_dec = self.kw_dec_var.get()
+        u_fil = self.kw_fil_var.get()
+        u_nor = self.kw_nor_var.get()
+        u_seg = self.kw_seg_var.get()
+
+        max_threads = int(self.kw_max_threads_var.get() or 10)
+        max_pages = int(self.kw_max_pages_var.get() or 50)
+        max_posts = int(self.kw_max_posts_var.get() or 10)
+        max_scroll = int(self.kw_max_scroll_var.get() or 30)
+
+        self.kw_extracted_data = []
+        self.kw_tree_data.delete(*self.kw_tree_data.get_children())
+        self.kw_log_textbox.configure(state="normal")
+        self.kw_log_textbox.delete("0.0", "end")
+        self.kw_log_textbox.configure(state="disabled")
+
+        self.kw_stop_event.clear()
+        self._set_kw_gui_state(True)
+
+        if kw_already_crawled:
+            self.kw_log_message(f"⚠ Keyword '{keyword}' đã có trong lịch sử {platform}. Vẫn tiếp tục cào...")
+        self.kw_log_message(f"Bắt đầu cào {platform} với keyword: {keyword}")
+
+        thread = threading.Thread(
+            target=self._keyword_crawl_thread,
+            args=(keyword, platform, u_dec, u_fil, u_nor, u_seg,
+                  max_threads, max_pages, max_posts, max_scroll),
+            daemon=True,
+        )
+        thread.start()
+
+    def stop_keyword_crawling(self):
+        if self.kw_is_running:
+            self.kw_log_message("Đang gửi lệnh yêu cầu dừng...")
+            self.kw_stop_event.set()
+            self.kw_stop_button.configure(state="disabled", text="Đang dừng...")
+            # Also try to kill the browser directly for faster stop
+            if self.kw_active_crawler:
+                try:
+                    self.kw_active_crawler.force_kill_driver()
+                except Exception:
+                    pass
+
+    # ---------------------------------------------------------
+    # TAB 3: FILE MANAGER
     # ---------------------------------------------------------
     def _setup_file_manager_tab(self):
         tab = self.tab_files
@@ -202,7 +548,7 @@ class App(ctk.CTk):
             os.system(f'explorer "{folder}"')
 
     # ---------------------------------------------------------
-    # TAB 3: CONFIG MANAGER
+    # TAB 4: CONFIG MANAGER
     # ---------------------------------------------------------
     def _setup_config_tab(self):
         tab = self.tab_config
@@ -451,6 +797,11 @@ class App(ctk.CTk):
                     writer.writerows(batch)
             except Exception as e:
                 self.after(0, self.log_message, f"Lỗi ghi CSV: {e}")
+        # Also append to warehouse.csv
+        try:
+            append_to_warehouse(batch)
+        except Exception as e:
+            self.after(0, self.log_message, f"Lỗi ghi warehouse: {e}")
         self.extracted_data.extend(batch)
 
     def _append_to_table(self, batch):
