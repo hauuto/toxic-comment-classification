@@ -11,6 +11,7 @@ from tkinter import messagebox, ttk
 from crawler import extract_comments_stream, VOZCrawler, ThreadsCrawler, load_keyword_history
 from nlp_pipeline.warehouse import append_to_warehouse, get_warehouse_count, read_warehouse, overwrite_warehouse
 from nlp_pipeline import VietnameseCommentPreprocessor
+from google_drive import upload_warehouse, download_warehouse
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
@@ -529,6 +530,18 @@ class App(ctk.CTk):
                        fg_color="red", hover_color="darkred",
                        command=self.wh_delete_selected).pack(side="right", padx=5)
 
+        # Row 3: Google Drive sync
+        row3 = ctk.CTkFrame(header, fg_color="transparent")
+        row3.pack(fill="x", padx=5, pady=(2, 5))
+
+        ctk.CTkLabel(row3, text="☁ Google Drive:", font=("Arial", 13, "bold")).pack(side="left", padx=(5, 10))
+        ctk.CTkButton(row3, text="⬆ Upload lên Drive", width=150,
+                       fg_color="#EA580C", hover_color="#C2410C",
+                       command=self.wh_upload_drive).pack(side="left", padx=5)
+        ctk.CTkButton(row3, text="⬇ Tải từ Drive", width=150,
+                       fg_color="#0284C7", hover_color="#0369A1",
+                       command=self.wh_download_drive).pack(side="left", padx=5)
+
         # --- Data table ---
         tf = ctk.CTkFrame(tab)
         tf.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
@@ -710,6 +723,86 @@ class App(ctk.CTk):
                 self._wh_is_processing = False
 
         threading.Thread(target=_process, daemon=True).start()
+
+    def wh_upload_drive(self):
+        """Upload warehouse.csv to Google Drive in background thread."""
+        if self._wh_is_processing:
+            messagebox.showwarning("Nhắc nhở", "Đang xử lý, vui lòng đợi...")
+            return
+        if not self._wh_all_rows:
+            messagebox.showwarning("Nhắc nhở", "Warehouse trống, không có gì để upload.")
+            return
+
+        self._wh_is_processing = True
+        self.wh_status_label.configure(text="⬆ Đang upload warehouse.csv lên Google Drive...", text_color="orange")
+
+        def _upload():
+            try:
+                def _log(msg):
+                    self.after(0, lambda: self.wh_status_label.configure(text=msg, text_color="orange"))
+
+                upload_warehouse(log_callback=_log)
+                self.after(0, lambda: self.wh_status_label.configure(
+                    text=f"✓ Đã upload warehouse.csv lên Google Drive ({len(self._wh_all_rows)} dòng).",
+                    text_color="green"))
+            except FileNotFoundError as e:
+                self.after(0, lambda: messagebox.showerror("Lỗi", str(e)))
+                self.after(0, lambda: self.wh_status_label.configure(
+                    text="✗ Upload thất bại: thiếu credentials.", text_color="red"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Lỗi Upload", f"Không thể upload lên Drive:\n{str(e)}"))
+                self.after(0, lambda: self.wh_status_label.configure(
+                    text=f"✗ Upload thất bại: {str(e)[:80]}", text_color="red"))
+            finally:
+                self._wh_is_processing = False
+
+        threading.Thread(target=_upload, daemon=True).start()
+
+    def wh_download_drive(self):
+        """Download warehouse.csv from Google Drive in background thread."""
+        if self._wh_is_processing:
+            messagebox.showwarning("Nhắc nhở", "Đang xử lý, vui lòng đợi...")
+            return
+
+        if self._wh_all_rows:
+            if not messagebox.askyesno(
+                "Xác nhận",
+                f"Warehouse hiện có {len(self._wh_all_rows)} dòng.\n"
+                "Tải từ Drive sẽ GHI ĐÈ toàn bộ dữ liệu local.\n\n"
+                "Bạn có muốn tiếp tục?"
+            ):
+                return
+
+        self._wh_is_processing = True
+        self.wh_status_label.configure(text="⬇ Đang tải warehouse.csv từ Google Drive...", text_color="orange")
+
+        def _download():
+            try:
+                def _log(msg):
+                    self.after(0, lambda: self.wh_status_label.configure(text=msg, text_color="orange"))
+
+                success = download_warehouse(log_callback=_log)
+                if success:
+                    self.after(0, self.wh_load_data)
+                    self.after(0, lambda: self.wh_status_label.configure(
+                        text="✓ Đã tải warehouse.csv từ Google Drive và cập nhật.",
+                        text_color="green"))
+                else:
+                    self.after(0, lambda: self.wh_status_label.configure(
+                        text="✗ Không tìm thấy warehouse.csv trên Google Drive.",
+                        text_color="red"))
+            except FileNotFoundError as e:
+                self.after(0, lambda: messagebox.showerror("Lỗi", str(e)))
+                self.after(0, lambda: self.wh_status_label.configure(
+                    text="✗ Download thất bại: thiếu credentials.", text_color="red"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Lỗi Download", f"Không thể tải từ Drive:\n{str(e)}"))
+                self.after(0, lambda: self.wh_status_label.configure(
+                    text=f"✗ Download thất bại: {str(e)[:80]}", text_color="red"))
+            finally:
+                self._wh_is_processing = False
+
+        threading.Thread(target=_download, daemon=True).start()
 
     # ---------------------------------------------------------
     # TAB 4: FILE MANAGER

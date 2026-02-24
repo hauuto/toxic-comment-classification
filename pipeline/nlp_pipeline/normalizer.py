@@ -101,38 +101,38 @@ class Normalizer:
             (re.compile(
                 r"(\d+(?:[.,]\d+)?)\s*(?:tỷ|tỉ)\b",
                 re.IGNORECASE | re.UNICODE,
-            ), r"<NUM> tỷ"),
+            ), r"<num> tỷ"),
             # e.g. "5 triệu", "1.5triệu"
             (re.compile(
                 r"(\d+(?:[.,]\d+)?)\s*triệu\b",
                 re.IGNORECASE | re.UNICODE,
-            ), r"<NUM> triệu"),
+            ), r"<num> triệu"),
             # e.g. "5 củ" (VN slang: 1 củ = 1 triệu đồng)
             (re.compile(
                 r"(\d+(?:[.,]\d+)?)\s*củ\b",
                 re.UNICODE,
-            ), r"<NUM> triệu"),
+            ), r"<num> triệu"),
             # e.g. "2k5" = 2500 (compound: digit + k + digit)
             (re.compile(
                 r"(\d+)[kK](\d+)\b",
                 re.UNICODE,
-            ), r"<NUM> nghìn"),
+            ), r"<num> nghìn"),
             # e.g. "2k", "5k", "10K", "2 nghìn", "3 ngàn"
             (re.compile(
                 r"(\d+(?:[.,]\d+)?)\s*(?:k|K|nghìn|ngàn)\b",
                 re.UNICODE,
-            ), r"<NUM> nghìn"),
+            ), r"<num> nghìn"),
             # e.g. "100 đồng", "50 đ", "200 vnd", "5 usd", "3 $"
             (re.compile(
                 r"(\d+(?:[.,]\d+)?)\s*(?:đồng|đ\b|vnd|usd|\$|€|£)",
                 re.IGNORECASE | re.UNICODE,
-            ), r"<NUM>"),
+            ), r"<num>"),
             # Standalone numbers (integers and decimals) not already replaced
             # Negative lookbehind for < and > to avoid matching <3 or >3 (emoji/emoticons)
             (re.compile(
                 r"(?<![\w<>])\d+(?:[.,]\d+)?(?![\w>])",
                 re.UNICODE,
-            ), r"<NUM>"),
+            ), r"<num>"),
         ]
 
         # Character elongation: 3+ consecutive same chars → max MAX_REPEAT_CHARS
@@ -147,10 +147,10 @@ class Normalizer:
         self._newline_pattern = re.compile(r"\n{3,}")
 
         # Placeholder protection: tokens like <url>, <mention>, <hashtag>, <email>,
-        # <date>, <NUM> should not be split or lowercased internally.
+        # <date>, <num> should not be split or lowercased internally.
         # We protect them by temporarily replacing with safe tokens during processing.
         self._placeholder_pattern = re.compile(
-            r"<(?:url|mention|hashtag|email|date|NUM)>",
+            r"<(?:url|mention|hashtag|email|date|num)>",
             re.IGNORECASE,
         )
 
@@ -204,7 +204,7 @@ class Normalizer:
 
     def normalize_ips(self, text: str) -> str:
         """Replace IP addresses with <IP> token."""
-        return self._ip_pattern.sub("<IP>", text)
+        return self._ip_pattern.sub("<ip>", text)
 
     def normalize_emails(self, text: str) -> str:
         """Replace email addresses with <email> token."""
@@ -236,11 +236,11 @@ class Normalizer:
         """Normalize numerical expressions.
 
         Examples:
-            "5 triệu" → "<NUM> triệu"
-            "2k" → "<NUM> nghìn"
-            "3 tỷ" → "<NUM> tỷ"
-            "100 đồng" → "<NUM>"
-            "42" → "<NUM>"
+            "5 triệu" → "<num> triệu"
+            "2k" → "<num> nghìn"
+            "3 tỷ" → "<num> tỷ"
+            "100 đồng" → "<num>"
+            "42" → "<num>"
         """
         for pattern, replacement in self._num_patterns:
             text = pattern.sub(replacement, text)
