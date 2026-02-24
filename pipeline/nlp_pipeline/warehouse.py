@@ -20,7 +20,7 @@ def _get_max_id(warehouse_path: str) -> int:
         return 0
     max_id = 0
     try:
-        with open(warehouse_path, "r", encoding="utf-8") as f:
+        with open(warehouse_path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
@@ -76,7 +76,7 @@ def get_warehouse_count(warehouse_path: str = None) -> int:
         return 0
     count = 0
     try:
-        with open(warehouse_path, "r", encoding="utf-8") as f:
+        with open(warehouse_path, "r", encoding="utf-8-sig") as f:
             reader = csv.reader(f)
             next(reader, None)  # skip header
             for _ in reader:
@@ -99,7 +99,7 @@ def read_warehouse(warehouse_path: str = None) -> list:
         return []
     rows = []
     try:
-        with open(warehouse_path, "r", encoding="utf-8") as f:
+        with open(warehouse_path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 rows.append({"id": int(row.get("id", 0)), "text": row.get("text", "")})
