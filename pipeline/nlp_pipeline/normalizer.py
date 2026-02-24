@@ -90,6 +90,9 @@ class Normalizer:
             re.compile(r"(?:năm\s+)(?:19|20)\d{2}\b", re.IGNORECASE),
         ]
 
+        # Timestamp pattern: 12:30, 1:45:00 (from 2-Preprocessing.ipynb)
+        self._timestamp_pattern = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
+
         # Numerical expression patterns
         # Order matters: longer units first
         # Vietnamese number units: tỷ/tỉ (billion), triệu (million), nghìn/ngàn/k (thousand)
@@ -225,6 +228,10 @@ class Normalizer:
             text = pattern.sub("<date>", text)
         return text
 
+    def normalize_timestamps(self, text: str) -> str:
+        """Replace time expressions (HH:MM or HH:MM:SS) with <TIME> token."""
+        return self._timestamp_pattern.sub("<TIME>", text)
+
     def normalize_numbers(self, text: str) -> str:
         """Normalize numerical expressions.
 
@@ -261,6 +268,7 @@ class Normalizer:
         text = self.normalize_mentions(text)
         text = self.normalize_hashtags(text)
         text = self.normalize_dates(text)
+        text = self.normalize_timestamps(text)
         text = self.normalize_via_signatures(text)
         text = self.normalize_char_elongation(text)
         text = self.normalize_punctuation(text)

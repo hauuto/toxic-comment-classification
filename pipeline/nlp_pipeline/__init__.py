@@ -8,6 +8,7 @@ from .decoder import Decoder
 from .filter import Filter
 from .normalizer import Normalizer
 from .word_segmentor import WordSegmentor
+from .vietnamese_typing_normalizer import VietnameseNormalizer
 
 class VietnameseCommentPreprocessor:
     def __init__(self, 
@@ -28,6 +29,7 @@ class VietnameseCommentPreprocessor:
         self.filter = Filter()
         
         self.normalizer = Normalizer(self.abbrev_path)
+        self.vn_typing_normalizer = VietnameseNormalizer()
         # Initialize the segmentor with VnCoreNLP backend using the pre-downloaded model
         # The java wrapper appends "/models" internally, so we just point to the root models dir
         current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -86,7 +88,14 @@ class VietnameseCommentPreprocessor:
         # Final check if normalization produced empty text
         if use_normalizer and len(current_text.strip()) == 0:
              return {"raw_text": text, "cleaned_text": "", "filter_reason": "empty_after_normalize", "is_valid": False}
-             
+
+        # 3.5. Vietnamese tone placement normalization (dấu thanh kiểu mới)
+        if use_normalizer:
+            try:
+                current_text = self.vn_typing_normalizer.normalize(current_text)
+            except Exception:
+                pass  # Non-critical: if it fails, just use the text as-is
+
         # 4. Segment (VnCoreNLP)
         if use_segmentor:
             try:

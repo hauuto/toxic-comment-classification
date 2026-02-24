@@ -15,6 +15,7 @@ from .config import (
     MIN_VIETNAMESE_RATIO,
     MAX_SPAM_REPEAT,
     VIETNAMESE_CHARS,
+    ADMIN_JUNK_PATTERNS,
 )
 
 # Pure ASCII letters that are common English-only (not used in Vietnamese)
@@ -45,6 +46,11 @@ class Filter:
 
         # Pattern matching :token: emoji placeholders and <placeholder> tokens
         self._token_pattern = re.compile(r":[a-z_]+:")
+
+        # VOZ admin/mod junk pattern (ban notices, system msgs, sent-from footers)
+        self._admin_junk_pattern = re.compile(
+            "|".join(ADMIN_JUNK_PATTERNS), re.IGNORECASE | re.MULTILINE
+        )
 
     # ------------------------------------------------------------------
     # Individual checks
@@ -135,6 +141,10 @@ class Filter:
         cleaned = self._token_pattern.sub("", text).strip()
         return len(cleaned) == 0 or all(not c.isalnum() for c in cleaned)
 
+    def is_admin_junk(self, text: str) -> bool:
+        """Check if comment is VOZ admin/mod action or system metadata."""
+        return bool(self._admin_junk_pattern.search(text))
+
     # ------------------------------------------------------------------
     # Main filter entry point
     # ------------------------------------------------------------------
@@ -152,6 +162,10 @@ class Filter:
         """
         if self.is_empty(text):
             return False, "empty"
+
+        # Admin junk check (VOZ mod actions, ban notices, sent-from footers)
+        if self.is_admin_junk(text):
+            return False, "admin_junk"
 
         # Raw length check (before normalize) — uses text if raw_text not given
         check_raw = raw_text if raw_text is not None else text
