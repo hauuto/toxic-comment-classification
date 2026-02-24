@@ -8,10 +8,8 @@ import threading
 import customtkinter as ctk
 from tkinter import messagebox, ttk
 
-from crawler import extract_comments_stream
-from keyword_crawler import VOZCrawler, ThreadsCrawler
-from warehouse import append_to_warehouse, get_warehouse_count
-from keyword_history import load_history as load_kw_history
+from crawler import extract_comments_stream, VOZCrawler, ThreadsCrawler, load_keyword_history
+from nlp_pipeline.warehouse import append_to_warehouse, get_warehouse_count, read_warehouse, overwrite_warehouse
 from nlp_pipeline import VietnameseCommentPreprocessor
 
 ctk.set_appearance_mode("System")
@@ -37,11 +35,13 @@ class App(ctk.CTk):
 
         self.tab_crawler = self.tabview.add("Facebook Crawler")
         self.tab_keyword = self.tabview.add("Keyword Crawler")
+        self.tab_warehouse = self.tabview.add("Warehouse Manager")
         self.tab_files = self.tabview.add("File Manager")
         self.tab_config = self.tabview.add("Config Manager")
 
         self._setup_crawler_tab()
         self._setup_keyword_crawler_tab()
+        self._setup_warehouse_tab()
         self._setup_file_manager_tab()
         self._setup_config_tab()
 
@@ -294,7 +294,7 @@ class App(ctk.CTk):
         for item in self.kw_history_tree.get_children():
             self.kw_history_tree.delete(item)
         try:
-            history = load_kw_history()
+            history = load_keyword_history()
             for platform in ["voz", "threads"]:
                 for kw in history.get(platform, []):
                     self.kw_history_tree.insert("", "end", values=(platform.upper(), kw))
@@ -425,7 +425,7 @@ class App(ctk.CTk):
         platform = self.kw_platform_var.get()
 
         # Check if keyword already in history – warn but allow
-        history = load_kw_history()
+        history = load_keyword_history()
         platform_key = platform.lower()
         kw_already_crawled = keyword in history.get(platform_key, [])
 
@@ -473,7 +473,246 @@ class App(ctk.CTk):
                     pass
 
     # ---------------------------------------------------------
-    # TAB 3: FILE MANAGER
+    # TAB 3: WAREHOUSE MANAGER
+    # ---------------------------------------------------------
+    def _setup_warehouse_tab(self):
+        tab = self.tab_warehouse
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        # --- Header / toolbar ---
+        header = ctk.CTkFrame(tab)
+        header.grid(row=0, column=0, padx=10, pady=5, sticky="ew")
+
+        # Row 1: search + stats
+        row1 = ctk.CTkFrame(header, fg_color="transparent")
+        row1.pack(fill="x", padx=5, pady=(5, 2))
+
+        ctk.CTkButton(row1, text="⟳ Tải dữ liệu", width=110, command=self.wh_load_data).pack(side="left", padx=5)
+
+        ctk.CTkLabel(row1, text="Tìm kiếm:").pack(side="left", padx=(15, 5))
+        self.wh_search_var = ctk.StringVar()
+        self.wh_search_entry = ctk.CTkEntry(row1, textvariable=self.wh_search_var, placeholder_text="Nhập text để lọc...", width=250)
+        self.wh_search_entry.pack(side="left", padx=5)
+        ctk.CTkButton(row1, text="Lọc", width=60, command=self.wh_filter_data).pack(side="left", padx=5)
+        ctk.CTkButton(row1, text="Xóa lọc", width=70, command=self.wh_clear_filter).pack(side="left", padx=5)
+
+        self.wh_stats_label = ctk.CTkLabel(row1, text="Warehouse: 0 dòng", text_color="gray")
+        self.wh_stats_label.pack(side="right", padx=10)
+
+        # Row 2: preprocessing options + actions
+        row2 = ctk.CTkFrame(header, fg_color="transparent")
+        row2.pack(fill="x", padx=5, pady=(2, 5))
+
+        ctk.CTkLabel(row2, text="Tiền xử lý:").pack(side="left", padx=(5, 5))
+
+        self.wh_dec_var = ctk.BooleanVar(value=True)
+        self.wh_fil_var = ctk.BooleanVar(value=True)
+        self.wh_nor_var = ctk.BooleanVar(value=True)
+        self.wh_seg_var = ctk.BooleanVar(value=False)
+
+        ctk.CTkCheckBox(row2, text="Decoder", variable=self.wh_dec_var).pack(side="left", padx=4)
+        ctk.CTkCheckBox(row2, text="Filter", variable=self.wh_fil_var).pack(side="left", padx=4)
+        ctk.CTkCheckBox(row2, text="Normalizer", variable=self.wh_nor_var).pack(side="left", padx=4)
+        ctk.CTkCheckBox(row2, text="VnCoreNLP", variable=self.wh_seg_var).pack(side="left", padx=4)
+
+        ctk.CTkButton(row2, text="▶ Chạy Preprocessing", width=150,
+                       fg_color="#2563EB", hover_color="#1D4ED8",
+                       command=self.wh_run_preprocessing).pack(side="left", padx=(15, 5))
+        ctk.CTkButton(row2, text="Xóa trùng lặp", width=110,
+                       fg_color="#7C3AED", hover_color="#6D28D9",
+                       command=self.wh_remove_duplicates).pack(side="left", padx=5)
+        ctk.CTkButton(row2, text="Xuất CSV", width=90,
+                       fg_color="#059669", hover_color="#047857",
+                       command=self.wh_export_csv).pack(side="left", padx=5)
+        ctk.CTkButton(row2, text="Xóa dòng chọn", width=100,
+                       fg_color="red", hover_color="darkred",
+                       command=self.wh_delete_selected).pack(side="right", padx=5)
+
+        # --- Data table ---
+        tf = ctk.CTkFrame(tab)
+        tf.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
+        tf.grid_columnconfigure(0, weight=1)
+        tf.grid_rowconfigure(0, weight=1)
+
+        self.wh_tree = ttk.Treeview(tf, columns=("id", "text"), show="headings", selectmode="extended")
+        self.wh_tree.heading("id", text="ID")
+        self.wh_tree.heading("text", text="Nội dung bình luận")
+        self.wh_tree.column("id", width=60, anchor="center")
+        self.wh_tree.column("text", width=800, anchor="w")
+
+        wh_scroll = ttk.Scrollbar(tf, orient="vertical", command=self.wh_tree.yview)
+        self.wh_tree.configure(yscrollcommand=wh_scroll.set)
+        self.wh_tree.grid(row=0, column=0, sticky="nsew")
+        wh_scroll.grid(row=0, column=1, sticky="ns")
+
+        # Status bar
+        self.wh_status_label = ctk.CTkLabel(tab, text="Trạng thái: Sẵn sàng", text_color="gray")
+        self.wh_status_label.grid(row=2, column=0, pady=5, sticky="w", padx=10)
+
+        # Internal data cache
+        self._wh_all_rows = []  # list of {"id": int, "text": str}
+        self._wh_is_processing = False
+
+        # Initial load
+        self.wh_load_data()
+
+    def wh_load_data(self):
+        """Load warehouse.csv into the table."""
+        self._wh_all_rows = read_warehouse()
+        self._wh_display_rows(self._wh_all_rows)
+        self.wh_stats_label.configure(text=f"Warehouse: {len(self._wh_all_rows)} dòng")
+        self.wh_status_label.configure(text=f"Đã tải {len(self._wh_all_rows)} dòng từ warehouse.csv", text_color="green")
+
+    def _wh_display_rows(self, rows):
+        """Populate the treeview with a list of row dicts."""
+        self.wh_tree.delete(*self.wh_tree.get_children())
+        for row in rows:
+            display_text = str(row.get("text", "")).replace("\n", "  ")
+            self.wh_tree.insert("", "end", values=(row.get("id", ""), display_text))
+
+    def wh_filter_data(self):
+        """Filter displayed rows by search term."""
+        query = self.wh_search_var.get().strip().lower()
+        if not query:
+            self._wh_display_rows(self._wh_all_rows)
+            return
+        filtered = [r for r in self._wh_all_rows if query in r.get("text", "").lower()]
+        self._wh_display_rows(filtered)
+        self.wh_status_label.configure(text=f"Hiển thị {len(filtered)}/{len(self._wh_all_rows)} dòng (lọc: '{query}')", text_color="blue")
+
+    def wh_clear_filter(self):
+        """Clear search filter and show all data."""
+        self.wh_search_var.set("")
+        self._wh_display_rows(self._wh_all_rows)
+        self.wh_status_label.configure(text=f"Hiển thị tất cả {len(self._wh_all_rows)} dòng", text_color="green")
+
+    def wh_delete_selected(self):
+        """Delete selected rows from warehouse."""
+        selected = self.wh_tree.selection()
+        if not selected:
+            messagebox.showwarning("Nhắc nhở", "Hãy chọn ít nhất 1 dòng để xóa.")
+            return
+        ids_to_delete = set()
+        for item in selected:
+            vals = self.wh_tree.item(item)["values"]
+            if vals:
+                ids_to_delete.add(int(vals[0]))
+        count_before = len(self._wh_all_rows)
+        if not messagebox.askyesno("Xác nhận", f"Xóa {len(ids_to_delete)} dòng khỏi warehouse.csv?"):
+            return
+        self._wh_all_rows = [r for r in self._wh_all_rows if r["id"] not in ids_to_delete]
+        # Re-assign IDs
+        for i, row in enumerate(self._wh_all_rows):
+            row["id"] = i + 1
+        overwrite_warehouse(self._wh_all_rows)
+        self._wh_display_rows(self._wh_all_rows)
+        removed = count_before - len(self._wh_all_rows)
+        self.wh_stats_label.configure(text=f"Warehouse: {len(self._wh_all_rows)} dòng")
+        self.wh_status_label.configure(text=f"Đã xóa {removed} dòng.", text_color="orange")
+
+    def wh_remove_duplicates(self):
+        """Remove duplicate texts from warehouse."""
+        seen = set()
+        unique = []
+        for row in self._wh_all_rows:
+            text = row.get("text", "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                unique.append(row)
+        removed = len(self._wh_all_rows) - len(unique)
+        if removed == 0:
+            messagebox.showinfo("Thông báo", "Không có dòng trùng lặp nào.")
+            return
+        # Re-assign IDs
+        for i, row in enumerate(unique):
+            row["id"] = i + 1
+        self._wh_all_rows = unique
+        overwrite_warehouse(self._wh_all_rows)
+        self._wh_display_rows(self._wh_all_rows)
+        self.wh_stats_label.configure(text=f"Warehouse: {len(self._wh_all_rows)} dòng")
+        self.wh_status_label.configure(text=f"Đã xóa {removed} dòng trùng lặp.", text_color="green")
+
+    def wh_export_csv(self):
+        """Export current warehouse data to a timestamped CSV."""
+        if not self._wh_all_rows:
+            messagebox.showwarning("Nhắc nhở", "Warehouse trống, không có gì để xuất.")
+            return
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        export_path = os.path.join(os.getcwd(), f"warehouse_export_{timestamp}.csv")
+        try:
+            with open(export_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["id", "text"])
+                writer.writeheader()
+                writer.writerows(self._wh_all_rows)
+            messagebox.showinfo("Thành công", f"Đã xuất {len(self._wh_all_rows)} dòng ra:\n{os.path.basename(export_path)}")
+            self.refresh_file_list()
+        except Exception as e:
+            messagebox.showerror("Lỗi", f"Không thể xuất CSV: {e}")
+
+    def wh_run_preprocessing(self):
+        """Run NLP preprocessing on all warehouse rows in a background thread."""
+        if self._wh_is_processing:
+            messagebox.showwarning("Nhắc nhở", "Đang xử lý, vui lòng đợi...")
+            return
+        if not self._wh_all_rows:
+            messagebox.showwarning("Nhắc nhở", "Warehouse trống.")
+            return
+
+        u_dec = self.wh_dec_var.get()
+        u_fil = self.wh_fil_var.get()
+        u_nor = self.wh_nor_var.get()
+        u_seg = self.wh_seg_var.get()
+
+        if not (u_dec or u_fil or u_nor or u_seg):
+            messagebox.showwarning("Nhắc nhở", "Hãy chọn ít nhất 1 bước tiền xử lý.")
+            return
+
+        self._wh_is_processing = True
+        self.wh_status_label.configure(text="Đang khởi tạo NLP pipeline... Vui lòng đợi.", text_color="orange")
+
+        def _process():
+            try:
+                preprocessor = VietnameseCommentPreprocessor()
+                total = len(self._wh_all_rows)
+                kept = []
+                removed_count = 0
+
+                for idx, row in enumerate(self._wh_all_rows):
+                    text = row.get("text", "")
+                    if not text.strip():
+                        removed_count += 1
+                        continue
+                    result = preprocessor.process_comment(
+                        text, use_decoder=u_dec, use_filter=u_fil,
+                        use_normalizer=u_nor, use_segmentor=u_seg,
+                    )
+                    if result["is_valid"]:
+                        kept.append({"id": len(kept) + 1, "text": result["cleaned_text"]})
+                    else:
+                        removed_count += 1
+
+                    if (idx + 1) % 500 == 0:
+                        self.after(0, lambda i=idx+1: self.wh_status_label.configure(
+                            text=f"Đang xử lý... {i}/{total}", text_color="orange"))
+
+                self._wh_all_rows = kept
+                overwrite_warehouse(kept)
+                self.after(0, self._wh_display_rows, kept)
+                self.after(0, lambda: self.wh_stats_label.configure(text=f"Warehouse: {len(kept)} dòng"))
+                self.after(0, lambda: self.wh_status_label.configure(
+                    text=f"Hoàn tất! Giữ {len(kept)}/{total} dòng (loại {removed_count} dòng).",
+                    text_color="green"))
+            except Exception as e:
+                self.after(0, lambda: self.wh_status_label.configure(
+                    text=f"Lỗi: {str(e)}", text_color="red"))
+            finally:
+                self._wh_is_processing = False
+
+        threading.Thread(target=_process, daemon=True).start()
+
+    # ---------------------------------------------------------
+    # TAB 4: FILE MANAGER
     # ---------------------------------------------------------
     def _setup_file_manager_tab(self):
         tab = self.tab_files

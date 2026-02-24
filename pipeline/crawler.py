@@ -1,8 +1,234 @@
+"""
+crawler.py – All crawlers consolidated into one module:
+  • URL-based crawlers (Facebook, YouTube, TikTok, Threads) via Playwright / YouTube API
+  • Keyword-based crawlers (VOZ, Threads) via Selenium + DuckDuckGo
+  • Keyword history management (keyword_history.json)
+  • YouTube API crawler (from .env YOUTUBE_API_KEY)
+"""
+import os
+import re
+import csv
+import json
 import time
+import random
+import subprocess
+import unicodedata
+import threading
+from typing import List, Optional
+
 from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
+from ddgs import DDGS
+from dotenv import load_dotenv
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+import undetected_chromedriver as uc
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 
 from nlp_pipeline import VietnameseCommentPreprocessor
-from youtube_crawler import extract_youtube_comments
+from nlp_pipeline.warehouse import append_to_warehouse
+
+load_dotenv()
+
+
+# =========================================================================== #
+#  Keyword History – persisted in keyword_history.json
+# =========================================================================== #
+
+_kw_lock = threading.Lock()
+_KW_HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keyword_history.json")
+
+
+def _ensure_kw_file():
+    if not os.path.isfile(_KW_HISTORY_PATH):
+        with open(_KW_HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump({"voz": [], "threads": []}, f, ensure_ascii=False, indent=2)
+
+
+def load_keyword_history() -> dict:
+    """Return ``{"voz": [...], "threads": [...]}``."""
+    _ensure_kw_file()
+    with _kw_lock:
+        with open(_KW_HISTORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    data.setdefault("voz", [])
+    data.setdefault("threads", [])
+    return data
+
+
+def add_keyword_to_history(platform: str, keyword: str) -> None:
+    """Add *keyword* under *platform* if not already present, then save."""
+    platform = platform.lower()
+    with _kw_lock:
+        _ensure_kw_file()
+        with open(_KW_HISTORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.setdefault(platform, [])
+        if keyword not in data[platform]:
+            data[platform].append(keyword)
+            with open(_KW_HISTORY_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def get_history_keywords(platform: str) -> list:
+    """Return list of crawled keywords for *platform*."""
+    return load_keyword_history().get(platform.lower(), [])
+
+
+# =========================================================================== #
+#  Shared helpers
+# =========================================================================== #
+
+def _sanitize_keyword(keyword: str) -> str:
+    """Remove diacritics, replace spaces with underscores."""
+    text = unicodedata.normalize("NFD", keyword)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    text = text.replace("đ", "d").replace("Đ", "D")
+    return text.replace(" ", "_")
+
+
+def _append_batch_to_csv(file_path: str, batch_data: List[str]) -> int:
+    """Incremental CSV writer (id auto-increment)."""
+    if not batch_data:
+        return 0
+    file_exists = os.path.isfile(file_path)
+    start_id = 1
+    if file_exists:
+        try:
+            with open(file_path, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        rid = int(row["id"])
+                        if rid >= start_id:
+                            start_id = rid + 1
+                    except (ValueError, KeyError):
+                        pass
+        except Exception:
+            start_id = 1
+    with open(file_path, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "text"])
+        if not file_exists:
+            writer.writeheader()
+        for i, text in enumerate(batch_data):
+            writer.writerow({"id": start_id + i, "text": text})
+    return len(batch_data)
+
+
+# =========================================================================== #
+#  YouTube API Crawler
+# =========================================================================== #
+
+def _extract_video_id(url: str) -> str:
+    """Extract the 11-char video ID from various YouTube URL formats."""
+    patterns = [r"(?:v=|/v/|youtu\.be/|/embed/|/shorts/)([a-zA-Z0-9_-]{11})"]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    if re.fullmatch(r"[a-zA-Z0-9_-]{11}", url.strip()):
+        return url.strip()
+    return ""
+
+
+def _sanitize_error(error_msg) -> str:
+    """Remove API keys from error messages to prevent leaking secrets."""
+    return re.sub(r'key=[A-Za-z0-9_-]+', 'key=***REDACTED***', str(error_msg))
+
+
+def extract_youtube_comments(
+    url_or_id: str, *, log_callback=None, data_callback=None, stop_event=None,
+    preprocessor=None, use_decoder: bool = True, use_filter: bool = True,
+    use_normalizer: bool = True, use_segmentor: bool = True,
+    current_id: int = 1, seen_texts: set = None, extracted_data: list = None,
+) -> int:
+    """Fetch all comments for a YouTube video via the Data API v3."""
+    def log(msg):
+        if log_callback: log_callback(msg)
+        else: print(msg)
+
+    if seen_texts is None: seen_texts = set()
+    if extracted_data is None: extracted_data = []
+
+    video_id = _extract_video_id(url_or_id)
+    if not video_id:
+        log(f"Không thể trích xuất Video ID từ: {url_or_id}")
+        return current_id
+
+    api_key = os.getenv("YOUTUBE_API_KEY", "").strip()
+    if not api_key:
+        log("Lỗi: Không tìm thấy YOUTUBE_API_KEY trong file .env")
+        return current_id
+
+    try:
+        youtube = build("youtube", "v3", developerKey=api_key)
+    except Exception as e:
+        log(f"Lỗi khởi tạo YouTube API client: {_sanitize_error(e)}")
+        return current_id
+
+    log(f"[YouTube API] Bắt đầu lấy bình luận cho video: {video_id}")
+    next_page_token = None
+    total_fetched = 0
+
+    while True:
+        if stop_event and stop_event.is_set():
+            log("[YouTube API] Đã nhận lệnh DỪNG."); break
+        try:
+            request = youtube.commentThreads().list(
+                part="snippet", videoId=video_id, maxResults=100,
+                pageToken=next_page_token, textFormat="plainText",
+            )
+            response = request.execute()
+        except HttpError as e:
+            if e.resp.status in (400, 404):
+                log(f"[YouTube API] Đã lấy hết bình luận khả dụng (API trả về {e.resp.status}).")
+            elif e.resp.status == 403:
+                log(f"[YouTube API] Hết quota hoặc bị từ chối: {_sanitize_error(e)}")
+            else:
+                log(f"[YouTube API] Lỗi HTTP {e.resp.status}: {_sanitize_error(e)}")
+            break
+        except Exception as e:
+            log(f"[YouTube API] Lỗi gọi API: {_sanitize_error(e)}"); break
+
+        items = response.get("items", [])
+        if not items: break
+
+        new_batch = []
+        for item in items:
+            if stop_event and stop_event.is_set(): break
+            snippet = item["snippet"]["topLevelComment"]["snippet"]
+            full_text = snippet.get("textDisplay", "").strip()
+            if not full_text or (len(full_text) < 2 and full_text not in ["Ok", "Dạ"]):
+                continue
+            if preprocessor:
+                processed = preprocessor.process_comment(full_text, use_decoder=use_decoder, use_filter=use_filter, use_normalizer=use_normalizer, use_segmentor=use_segmentor)
+                if not processed["is_valid"]: continue
+                clean_text = processed["cleaned_text"]
+            else:
+                clean_text = full_text
+            if clean_text not in seen_texts:
+                seen_texts.add(clean_text)
+                row = {"id": current_id, "text": clean_text}
+                new_batch.append(row); extracted_data.append(row); current_id += 1
+
+        if new_batch:
+            total_fetched += len(new_batch)
+            if data_callback: data_callback(new_batch)
+            log(f"[YouTube API] +{len(new_batch)} bình luận (Tổng: {total_fetched})")
+
+        next_page_token = response.get("nextPageToken")
+        if not next_page_token: break
+
+    log(f"[YouTube API] Hoàn tất video {video_id} – tổng {total_fetched} bình luận.")
+    return current_id
+
+
+# =========================================================================== #
+#  Playwright URL crawlers (Facebook, TikTok, Threads-URL)
+# =========================================================================== #
 
 def _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback):
     log("Đợi trang ổn định...")
@@ -18,7 +244,6 @@ def _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocesso
     except Exception:
         pass 
         
-    # JS to mutate DOM so text_content() grabs @Name_Here and alt text for emojis
     replace_tags_js = r"""
         const links = document.querySelectorAll('div[dir="auto"] a');
         links.forEach(a => {
@@ -47,7 +272,6 @@ def _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocesso
         if stop_event and stop_event.is_set():
             return current_id
 
-        # Expand "View more comments"
         view_more_selectors = ['span:text-is("Xem thêm bình luận")', 'span:text-is("View more comments")', 'div[role="button"]:has-text("Xem thêm bình luận")']
         for selector in view_more_selectors:
             try:
@@ -58,7 +282,6 @@ def _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocesso
             except Exception:
                 pass
         
-        # Expand "View N replies" 
         reply_selectors = ['span:has-text(" xem phản hồi")', 'span:has-text(" replies")', 'div[role="button"]:has-text(" xem phản hồi")']
         for selector in reply_selectors:
             try:
@@ -69,7 +292,6 @@ def _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocesso
             except Exception:
                 pass
                 
-        # Expand "See more" (long comments)
         see_more_selectors = ['div[dir="auto"][role="button"]:has-text("Xem thêm")', 'div[dir="auto"][role="button"]:has-text("See more")']
         for selector in see_more_selectors:
             try:
@@ -335,11 +557,7 @@ def extract_comments_stream(url_input: str, headless: bool = False,
                             use_segmentor: bool = True,
                             log_callback=None, data_callback=None, stop_event=None):
     """
-    Crawls comments iteratively. Supports multiple URLs separated by semicolon.
-    Supports Facebook, YouTube, TikTok, Threads. Auto-detects based on URL.
-    - log_callback(msg): send status messages to GUI.
-    - data_callback(list_of_dicts): send newly extracted comments to GUI/CSV.
-    - stop_event (threading.Event): check if user requested to stop.
+    Crawls comments from URLs (FB, YT, TikTok, Threads). Semicolon-separated.
     """
     def log(msg):
         if log_callback:
@@ -433,3 +651,502 @@ def extract_comments_stream(url_input: str, headless: bool = False,
         log(f"Lỗi Crawler: {str(e)}")
         
     return extracted_data
+
+
+# =========================================================================== #
+#  VOZ Keyword Crawler
+# =========================================================================== #
+
+class VOZCrawler:
+    """VOZ forum crawler – search keyword via DuckDuckGo, scrape comments."""
+
+    def __init__(self, keyword=None, max_threads=10, max_pages=50, timeout=20,
+                 offset_x=-1000, log_callback=None, stop_event=None, data_callback=None,
+                 preprocessor=None, use_decoder=True, use_filter=True,
+                 use_normalizer=True, use_segmentor=True):
+        self.keyword = keyword
+        self.max_threads = max_threads
+        self.max_pages = max_pages
+        self.timeout = timeout
+        self.offset_x = offset_x
+        self.log_callback = log_callback
+        self.stop_event = stop_event
+        self.data_callback = data_callback
+        self.preprocessor = preprocessor
+        self.use_decoder = use_decoder
+        self.use_filter = use_filter
+        self.use_normalizer = use_normalizer
+        self.use_segmentor = use_segmentor
+        self.driver = None
+
+    def _log(self, msg: str):
+        if self.log_callback: self.log_callback(msg)
+        else: print(msg)
+
+    def _stopped(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
+
+    def get_output_path(self, keyword=None) -> str:
+        keyword = keyword or self.keyword
+        clean = _sanitize_keyword(keyword)
+        return os.path.join(os.getcwd(), f"{clean}_{self.max_threads}_{self.max_pages}.csv")
+
+    def get_driver(self):
+        self._log("[VOZ] Khởi tạo Chrome Driver...")
+        user_data_dir = os.path.join(os.getcwd(), "chrome_profile_fixed")
+        opts = uc.ChromeOptions()
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.page_load_strategy = "normal"
+        driver = uc.Chrome(options=opts, user_data_dir=user_data_dir, version_main=None, use_subprocess=True)
+        try:
+            driver.set_window_position(self.offset_x, 0)
+            time.sleep(1)
+            driver.maximize_window()
+        except Exception: pass
+        driver.set_page_load_timeout(self.timeout)
+        try:
+            driver.execute_cdp_cmd("Network.enable", {})
+            driver.execute_cdp_cmd("Network.setBlockedURLs", {
+                "urls": ["*googleads*", "*doubleclick*", "*googlesyndication*",
+                         "*adservice*", "*google_vignette*", "*.gif"]
+            })
+        except Exception: pass
+        self.driver = driver
+        return driver
+
+    def force_kill_driver(self, driver=None):
+        driver = driver or self.driver
+        pid = None
+        if driver:
+            try: pid = driver.service.process.pid
+            except Exception: pass
+            try: driver.quit()
+            except Exception: pass
+        if pid:
+            try: subprocess.call(["taskkill", "/F", "/T", "/PID", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception: pass
+        if driver is self.driver: self.driver = None
+
+    def close(self): self.force_kill_driver()
+
+    def restart_driver(self):
+        self.force_kill_driver()
+        return self.get_driver()
+
+    def search_voz(self, keyword=None, limit=None) -> List[str]:
+        keyword = keyword or self.keyword
+        limit = limit or self.max_threads
+        self._log(f"[VOZ] Tìm link cho: {keyword}")
+        results = []
+        try:
+            with DDGS() as ddgs:
+                gen = ddgs.text(f"site:voz.vn {keyword}", max_results=limit + 10)
+                for r in gen:
+                    href = r.get("href")
+                    if href and "/t/" in href and href not in results:
+                        results.append(href)
+                    if len(results) >= limit: break
+        except Exception as e:
+            self._log(f"[VOZ] Lỗi search: {e}")
+        self._log(f"[VOZ] Tìm thấy {len(results)} thread links.")
+        return results
+
+    def scrape_comments(self, url: str, max_pages=None) -> List[str]:
+        if self.driver is None: self.get_driver()
+        max_pages = max_pages or self.max_pages
+        current_thread_comments = []
+        base_url = url.split("/page-")[0].rstrip("/")
+        self._log(f"  -> Scraping: {base_url}")
+
+        for page in range(1, max_pages + 1):
+            if self._stopped(): break
+            try:
+                target_url = base_url if page == 1 else f"{base_url}/page-{page}"
+                try: self.driver.get(target_url)
+                except TimeoutException:
+                    try: self.driver.execute_script("window.stop();")
+                    except Exception: pass
+
+                if "Just a moment" in (self.driver.title or ""):
+                    self._log("    [ALERT] Cloudflare! Waiting...")
+                    time.sleep(5)
+
+                try:
+                    self.driver.execute_script("""
+                        var v = document.getElementById('google_vignette_modal');
+                        if (v) v.remove();
+                        document.body.style.overflow = 'auto';
+                    """)
+                except Exception: pass
+
+                time.sleep(random.uniform(2, 3))
+                soup = BeautifulSoup(self.driver.page_source, "html.parser")
+                posts = soup.select(".message-inner")
+                if not posts:
+                    time.sleep(2)
+                    soup = BeautifulSoup(self.driver.page_source, "html.parser")
+                    posts = soup.select(".message-inner")
+                    if not posts:
+                        self._log("    [WARN] Trang trống hoặc bị chặn (0 post).")
+                        break
+
+                for post in posts:
+                    content_tag = post.select_one(".bbWrapper")
+                    if content_tag:
+                        for q in content_tag.find_all("blockquote"): q.decompose()
+                        for br in content_tag.find_all("br"): br.replace_with("\n")
+                        text = content_tag.get_text(separator="\n", strip=True)
+                        text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)
+                        text = re.sub(r"\n+", "\n", text)
+                        if text: current_thread_comments.append(text)
+
+                if not soup.select_one("a.pageNav-jump--next"): break
+            except WebDriverException: raise
+            except Exception: break
+
+        return current_thread_comments
+
+    def crawl_keyword(self, keyword=None, persist: bool = True) -> List[str]:
+        keyword = keyword or self.keyword
+        if not keyword: raise ValueError("keyword is required")
+        if self.driver is None: self.get_driver()
+
+        output_path = self.get_output_path(keyword)
+        urls = self.search_voz(keyword, self.max_threads)
+        if not urls:
+            self._log("[VOZ] Không tìm thấy link nào.")
+            return []
+
+        all_texts: List[str] = []
+        seen_texts: set = set()
+
+        for i, url in enumerate(urls):
+            if self._stopped():
+                self._log("[VOZ] Đã nhận lệnh DỪNG.")
+                break
+
+            self._log(f"\n[VOZ] [KEYWORD: {keyword}] [THREAD {i+1}/{len(urls)}]")
+            try:
+                raw_batch = self.scrape_comments(url, self.max_pages)
+                if not raw_batch:
+                    self._log("    [WARN] Không có data -> Nghi ngờ treo.")
+                    raise WebDriverException("Zero data returned")
+
+                processed_batch: List[str] = []
+                for text in raw_batch:
+                    if self.preprocessor:
+                        result = self.preprocessor.process_comment(
+                            text, use_decoder=self.use_decoder, use_filter=self.use_filter,
+                            use_normalizer=self.use_normalizer, use_segmentor=self.use_segmentor,
+                        )
+                        if not result["is_valid"]: continue
+                        clean = result["cleaned_text"]
+                    else:
+                        clean = text
+                    if clean and clean not in seen_texts:
+                        seen_texts.add(clean)
+                        processed_batch.append(clean)
+
+                if processed_batch:
+                    all_texts.extend(processed_batch)
+                    if persist:
+                        count = _append_batch_to_csv(output_path, processed_batch)
+                        self._log(f"    [CSV] +{count} dòng -> {os.path.basename(output_path)}")
+                    wh_rows = [{"text": t} for t in processed_batch]
+                    wh_count = append_to_warehouse(wh_rows)
+                    self._log(f"    [WAREHOUSE] +{wh_count} dòng")
+                    if self.data_callback:
+                        gui_batch = [{"id": idx, "text": t} for idx, t in enumerate(processed_batch, start=len(all_texts) - len(processed_batch) + 1)]
+                        self.data_callback(gui_batch)
+
+            except WebDriverException as e:
+                self._log(f"    [CRITICAL] Lỗi/Treo: {e}")
+                self._log("    [RECOVERY] Restarting Driver...")
+                try:
+                    self.restart_driver()
+                    self._log("    [RECOVERY] Driver mới sẵn sàng.")
+                except Exception:
+                    self._log("    [FATAL] Không thể restart driver.")
+                    break
+            except Exception as e:
+                self._log(f"    [ERROR] {e}")
+
+        if all_texts:
+            add_keyword_to_history("voz", keyword)
+            self._log(f"[VOZ] Đã thêm '{keyword}' vào lịch sử keyword.")
+
+        self._log(f"[VOZ] Hoàn tất '{keyword}' – tổng {len(all_texts)} bình luận.")
+        return all_texts
+
+
+# =========================================================================== #
+#  Threads Keyword Crawler
+# =========================================================================== #
+
+class ThreadsCrawler:
+    """Threads (Meta) crawler – search keyword via DuckDuckGo, scrape comments."""
+
+    def __init__(self, keyword=None, max_posts=10, max_scroll=30, timeout=20,
+                 offset_x=-1000, log_callback=None, stop_event=None, data_callback=None,
+                 preprocessor=None, use_decoder=True, use_filter=True,
+                 use_normalizer=True, use_segmentor=True):
+        self.keyword = keyword
+        self.max_posts = max_posts
+        self.max_scroll = max_scroll
+        self.timeout = timeout
+        self.offset_x = offset_x
+        self.log_callback = log_callback
+        self.stop_event = stop_event
+        self.data_callback = data_callback
+        self.preprocessor = preprocessor
+        self.use_decoder = use_decoder
+        self.use_filter = use_filter
+        self.use_normalizer = use_normalizer
+        self.use_segmentor = use_segmentor
+        self.driver = None
+        self.comments: List[str] = []
+
+    def _log(self, msg: str):
+        if self.log_callback: self.log_callback(msg)
+        else: print(msg)
+
+    def _stopped(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
+
+    def get_output_path(self, keyword=None) -> str:
+        keyword = keyword or self.keyword
+        clean = _sanitize_keyword(keyword)
+        return os.path.join(os.getcwd(), f"threads_{clean}_{self.max_posts}_{self.max_scroll}.csv")
+
+    def get_driver(self):
+        self._log("[Threads] Khởi tạo Chrome Driver...")
+        user_data_dir = os.path.join(os.getcwd(), "chrome_profile_threads")
+        opts = uc.ChromeOptions()
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_argument("--disable-notifications")
+        opts.page_load_strategy = "normal"
+        driver = uc.Chrome(options=opts, user_data_dir=user_data_dir, version_main=None, use_subprocess=True)
+        try:
+            driver.set_window_position(self.offset_x, 0)
+            time.sleep(1)
+            driver.maximize_window()
+        except Exception: pass
+        driver.set_page_load_timeout(self.timeout)
+        try:
+            driver.execute_cdp_cmd("Network.enable", {})
+            driver.execute_cdp_cmd("Network.setBlockedURLs", {
+                "urls": ["*googleads*", "*doubleclick*", "*googlesyndication*",
+                         "*adservice*", "*google_vignette*"]
+            })
+        except Exception: pass
+        self.driver = driver
+        return driver
+
+    def force_kill_driver(self, driver=None):
+        driver = driver or self.driver
+        pid = None
+        if driver:
+            try: pid = driver.service.process.pid
+            except Exception: pass
+            try: driver.quit()
+            except Exception: pass
+        if pid:
+            try: subprocess.call(["taskkill", "/F", "/T", "/PID", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception: pass
+        if driver is self.driver: self.driver = None
+
+    def close(self): self.force_kill_driver()
+
+    def restart_driver(self):
+        self.force_kill_driver()
+        return self.get_driver()
+
+    def search_threads(self, keyword=None, limit=None) -> List[str]:
+        keyword = keyword or self.keyword
+        limit = limit or self.max_posts
+        self._log(f"[Threads] Tìm link cho: {keyword}")
+        results: List[str] = []
+        try:
+            with DDGS() as ddgs:
+                gen = ddgs.text(f"site:threads.net {keyword}", max_results=limit + 20)
+                for r in gen:
+                    href = r.get("href", "")
+                    if "threads.net" in href and "/post/" in href and href not in results:
+                        results.append(href)
+                    if len(results) >= limit: break
+        except Exception as e:
+            self._log(f"[Threads] Lỗi search: {e}")
+        self._log(f"[Threads] Tìm thấy {len(results)} post links.")
+        return results
+
+    def _dismiss_login_popup(self):
+        try:
+            ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
+            time.sleep(0.5)
+        except Exception: pass
+        for sel in ['[aria-label="Close"]', '[aria-label="Đóng"]']:
+            try:
+                self.driver.find_element(By.CSS_SELECTOR, sel).click()
+                time.sleep(0.5)
+                return
+            except Exception: continue
+
+    def _scroll_to_load_replies(self, max_scroll=None):
+        max_scroll = max_scroll or self.max_scroll
+        prev_height = 0
+        for i in range(max_scroll):
+            if self._stopped(): break
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(random.uniform(1.5, 2.5))
+            try:
+                btns = self.driver.find_elements(
+                    By.XPATH,
+                    "//*[contains(text(),'View more replies') or "
+                    "contains(text(),'Xem thêm') or "
+                    "contains(text(),'View replies') or "
+                    "contains(text(),'more repl')]",
+                )
+                for btn in btns:
+                    try:
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(random.uniform(1.0, 2.0))
+                    except Exception: pass
+            except Exception: pass
+            curr_height = self.driver.execute_script("return document.body.scrollHeight")
+            if curr_height == prev_height:
+                time.sleep(1.0)
+                curr_height = self.driver.execute_script("return document.body.scrollHeight")
+                if curr_height == prev_height: break
+            prev_height = curr_height
+            if (i + 1) % 5 == 0:
+                self._log(f"    [SCROLL] Lần {i+1}/{max_scroll}...")
+
+    def _parse_comments(self, page_source: str) -> List[str]:
+        soup = BeautifulSoup(page_source, "html.parser")
+        results: List[str] = []
+        seen: set = set()
+        UI_TEXTS = {
+            "Reply", "Trả lời", "Like", "Thích", "Share", "Chia sẻ",
+            "Repost", "More", "Follow", "Theo dõi", "Log in", "Đăng nhập",
+            "Sign up", "Đăng ký", "Search", "Tìm kiếm", "Verified",
+            "liked", "likes", "replies", "reply",
+        }
+        blocks = soup.select('div[data-pressable-container="true"]')
+        if blocks:
+            for block in blocks:
+                username = ""
+                uname_el = block.select_one('a[role="link"] span')
+                if uname_el: username = uname_el.get_text(strip=True)
+                spans = block.select('div[dir="auto"]')
+                texts = []
+                for s in spans:
+                    t = s.get_text(strip=True)
+                    if t and len(t) > 1 and t != username and t not in UI_TEXTS and not t.startswith("http"):
+                        texts.append(t)
+                if texts:
+                    main_text = max(texts, key=len)
+                    if main_text not in seen:
+                        seen.add(main_text)
+                        results.append(main_text)
+        if not results:
+            for el in soup.select('div[dir="auto"], span[dir="auto"]'):
+                t = el.get_text(strip=True)
+                if t and len(t) > 3 and t not in seen and t not in UI_TEXTS and not t.startswith("http"):
+                    seen.add(t)
+                    results.append(t)
+        return results
+
+    def scrape_comments(self, url: str, max_scroll=None) -> List[str]:
+        if self.driver is None: self.get_driver()
+        self._log(f"  -> Scraping: {url}")
+        try:
+            try: self.driver.get(url)
+            except TimeoutException:
+                try: self.driver.execute_script("window.stop();")
+                except Exception: pass
+            time.sleep(random.uniform(3.0, 5.0))
+            self._dismiss_login_popup()
+            self._scroll_to_load_replies(max_scroll)
+            post_comments = self._parse_comments(self.driver.page_source)
+            self._log(f"    [OK] {len(post_comments)} comments.")
+            return post_comments
+        except WebDriverException: raise
+        except Exception as e:
+            self._log(f"    [ERROR] {e}")
+            return []
+
+    def crawl_keyword(self, keyword=None, persist: bool = True) -> List[str]:
+        keyword = keyword or self.keyword
+        if not keyword: raise ValueError("keyword is required")
+        if self.driver is None: self.get_driver()
+
+        output_path = self.get_output_path(keyword)
+        urls = self.search_threads(keyword, self.max_posts)
+        if not urls:
+            self._log("[Threads] Không tìm thấy link nào.")
+            return []
+
+        all_texts: List[str] = []
+        seen_texts: set = set()
+
+        for i, url in enumerate(urls):
+            if self._stopped():
+                self._log("[Threads] Đã nhận lệnh DỪNG.")
+                break
+
+            self._log(f"\n[Threads] [KEYWORD: {keyword}] [POST {i+1}/{len(urls)}]")
+            try:
+                raw_batch = self.scrape_comments(url, self.max_scroll)
+                if not raw_batch:
+                    self._log("    [WARN] Không có data -> có thể bị chặn.")
+                    raise WebDriverException("Zero data returned")
+
+                processed_batch: List[str] = []
+                for text in raw_batch:
+                    if self.preprocessor:
+                        result = self.preprocessor.process_comment(
+                            text, use_decoder=self.use_decoder, use_filter=self.use_filter,
+                            use_normalizer=self.use_normalizer, use_segmentor=self.use_segmentor,
+                        )
+                        if not result["is_valid"]: continue
+                        clean = result["cleaned_text"]
+                    else:
+                        clean = text
+                    if clean and clean not in seen_texts:
+                        seen_texts.add(clean)
+                        processed_batch.append(clean)
+
+                if processed_batch:
+                    all_texts.extend(processed_batch)
+                    self.comments.extend(processed_batch)
+                    if persist:
+                        count = _append_batch_to_csv(output_path, processed_batch)
+                        self._log(f"    [CSV] +{count} dòng -> {os.path.basename(output_path)}")
+                    wh_rows = [{"text": t} for t in processed_batch]
+                    wh_count = append_to_warehouse(wh_rows)
+                    self._log(f"    [WAREHOUSE] +{wh_count} dòng")
+                    if self.data_callback:
+                        gui_batch = [{"id": idx, "text": t} for idx, t in enumerate(processed_batch, start=len(all_texts) - len(processed_batch) + 1)]
+                        self.data_callback(gui_batch)
+
+            except WebDriverException as e:
+                self._log(f"    [CRITICAL] Lỗi/Treo: {e}")
+                self._log("    [RECOVERY] Restarting Driver...")
+                try:
+                    self.restart_driver()
+                    self._log("    [RECOVERY] Driver mới sẵn sàng.")
+                except Exception:
+                    self._log("    [FATAL] Không thể restart driver.")
+                    break
+            except Exception as e:
+                self._log(f"    [ERROR] Bỏ qua: {e}")
+
+            time.sleep(random.uniform(2.0, 4.0))
+
+        if all_texts:
+            add_keyword_to_history("threads", keyword)
+            self._log(f"[Threads] Đã thêm '{keyword}' vào lịch sử keyword.")
+
+        self._log(f"[Threads] Hoàn tất '{keyword}' – tổng {len(all_texts)} bình luận.")
+        return all_texts
+
