@@ -14,8 +14,6 @@ import random
 import subprocess
 import unicodedata
 import threading
-import math
-from typing import Dict, Any
 from typing import List, Optional
 
 from playwright.sync_api import sync_playwright
@@ -28,7 +26,6 @@ except Exception:
         return False
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-import requests
 import undetected_chromedriver as uc
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
@@ -117,7 +114,7 @@ _KW_HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "key
 def _ensure_kw_file():
     if not os.path.isfile(_KW_HISTORY_PATH):
         with open(_KW_HISTORY_PATH, "w", encoding="utf-8") as f:
-            json.dump({"voz": [], "threads": [], "google_maps": []}, f, ensure_ascii=False, indent=2)
+            json.dump({"voz": [], "threads": []}, f, ensure_ascii=False, indent=2)
 
 
 def load_keyword_history() -> dict:
@@ -128,7 +125,6 @@ def load_keyword_history() -> dict:
             data = json.load(f)
     data.setdefault("voz", [])
     data.setdefault("threads", [])
-    data.setdefault("google_maps", [])
     return data
 
 
@@ -1303,298 +1299,5 @@ class ThreadsCrawler:
             self._log(f"[Threads] Đã thêm '{keyword}' vào lịch sử keyword.")
 
         self._log(f"[Threads] Hoàn tất '{keyword}' – tổng {len(all_texts)} bình luận.")
-        return all_texts
-
-
-# =========================================================================== #
-#  Google Maps (Places API) Area Scanner
-# =========================================================================== #
-
-class GoogleMapsCrawler:
-    """Google Maps crawler via Places API (Nearby Search + Place Details).
-
-    IMPORTANT LIMITATION:
-    - Places Details API returns only a limited number of reviews per place.
-      This crawler fetches the maximum reviews provided by the API response,
-      but cannot guarantee "all" reviews.
-    """
-
-    def __init__(
-        self,
-        keyword: str | None = None,
-        center_lat: float = 0.0,
-        center_lng: float = 0.0,
-        radius_m: int = 3000,
-        grid_step_m: int = 1500,
-        max_places: int = 200,
-        max_reviews_per_place: int = 5,
-        language: str = "vi",
-        place_type: str = "",
-        log_callback=None,
-        stop_event=None,
-        data_callback=None,
-        preprocessor: VietnameseCommentPreprocessor | None = None,
-        use_decoder: bool = True,
-        use_filter: bool = True,
-        use_normalizer: bool = True,
-        use_segmentor: bool = True,
-    ):
-        self.keyword = keyword
-        self.center_lat = center_lat
-        self.center_lng = center_lng
-        self.radius_m = int(radius_m)
-        self.grid_step_m = max(200, int(grid_step_m))
-        self.max_places = max(1, int(max_places))
-        self.max_reviews_per_place = max(1, int(max_reviews_per_place))
-        self.language = language or "vi"
-        self.place_type = (place_type or "").strip()
-
-        self.log_callback = log_callback
-        self.stop_event = stop_event
-        self.data_callback = data_callback
-
-        self.preprocessor = preprocessor
-        self.use_decoder = use_decoder
-        self.use_filter = use_filter
-        self.use_normalizer = use_normalizer
-        self.use_segmentor = use_segmentor
-
-        self.api_key = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
-        if not self.api_key:
-            raise RuntimeError("Missing GOOGLE_MAPS_API_KEY")
-
-        self.session = requests.Session()
-
-    def _log(self, msg: str):
-        if self.log_callback:
-            self.log_callback(msg)
-        else:
-            print(msg)
-
-    def _stopped(self) -> bool:
-        return self.stop_event is not None and self.stop_event.is_set()
-
-    def close(self):
-        try:
-            self.session.close()
-        except Exception:
-            pass
-
-    def force_kill_driver(self):
-        # No browser used; just honor stop_event.
-        if self.stop_event is not None:
-            self.stop_event.set()
-
-    @staticmethod
-    def _meters_to_lat_deg(m: float) -> float:
-        return m / 111_320.0
-
-    @staticmethod
-    def _meters_to_lng_deg(m: float, lat_deg: float) -> float:
-        # Avoid division by zero near poles
-        denom = 111_320.0 * max(0.1, math.cos(math.radians(lat_deg)))
-        return m / denom
-
-    def _grid_points(self) -> List[tuple[float, float]]:
-        """Generate a simple grid of (lat,lng) points inside a radius circle."""
-        points: List[tuple[float, float]] = []
-        r = max(200, int(self.radius_m))
-        step = max(200, int(self.grid_step_m))
-
-        for dy in range(-r, r + 1, step):
-            if self._stopped():
-                break
-            lat = self.center_lat + self._meters_to_lat_deg(dy)
-            for dx in range(-r, r + 1, step):
-                if dx * dx + dy * dy > r * r:
-                    continue
-                lng = self.center_lng + self._meters_to_lng_deg(dx, self.center_lat)
-                points.append((lat, lng))
-
-        # Always include center
-        if (self.center_lat, self.center_lng) not in points:
-            points.insert(0, (self.center_lat, self.center_lng))
-        return points
-
-    def _nearby_search(self, lat: float, lng: float, search_radius: int, keyword: str) -> List[Dict[str, Any]]:
-        url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-        params: Dict[str, Any] = {
-            "key": self.api_key,
-            "location": f"{lat},{lng}",
-            "radius": int(search_radius),
-            "keyword": keyword,
-            "language": self.language,
-        }
-        if self.place_type:
-            params["type"] = self.place_type
-
-        results: List[Dict[str, Any]] = []
-        page_token: str | None = None
-        for page in range(3):
-            if self._stopped():
-                break
-
-            if page_token:
-                # Google requires a short delay for next_page_token to become valid.
-                time.sleep(2.0)
-                params = {"key": self.api_key, "pagetoken": page_token}
-
-            r = self.session.get(url, params=params, timeout=20)
-            r.raise_for_status()
-            data = r.json()
-            status = data.get("status")
-            if status not in {"OK", "ZERO_RESULTS"}:
-                raise RuntimeError(f"Places nearbysearch error: {status} {data.get('error_message', '')}".strip())
-
-            page_results = data.get("results", []) or []
-            for item in page_results:
-                if isinstance(item, dict):
-                    results.append(item)
-
-            page_token = data.get("next_page_token")
-            if not page_token:
-                break
-
-        return results
-
-    def _place_details(self, place_id: str) -> Dict[str, Any]:
-        url = "https://maps.googleapis.com/maps/api/place/details/json"
-        fields = "place_id,name,formatted_address,url,rating,user_ratings_total,reviews"
-        params = {
-            "key": self.api_key,
-            "place_id": place_id,
-            "fields": fields,
-            "language": self.language,
-            "reviews_sort": "newest",
-        }
-        r = self.session.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        status = data.get("status")
-        if status != "OK":
-            raise RuntimeError(f"Places details error: {status} {data.get('error_message', '')}".strip())
-        return data.get("result", {}) or {}
-
-    def crawl_keyword(self, keyword=None) -> List[str]:
-        keyword = (keyword or self.keyword or "").strip()
-        if not keyword:
-            raise ValueError("keyword is required")
-
-        self._log(f"[GoogleMaps] Quét khu vực: center=({self.center_lat},{self.center_lng}) radius={self.radius_m}m step={self.grid_step_m}m")
-        self._log(f"[GoogleMaps] Keyword: {keyword} | type={self.place_type or '(any)'} | language={self.language}")
-
-        grid = self._grid_points()
-        self._log(f"[GoogleMaps] Grid points: {len(grid)}")
-
-        place_ids: List[str] = []
-        seen_places: set[str] = set()
-
-        search_radius = min(50_000, max(200, int(self.grid_step_m * 1.2)))
-
-        for i, (lat, lng) in enumerate(grid, start=1):
-            if self._stopped():
-                self._log("[GoogleMaps] Đã nhận lệnh DỪNG.")
-                break
-
-            self._log(f"[GoogleMaps] Nearby search {i}/{len(grid)} @ ({lat:.6f},{lng:.6f})")
-            try:
-                results = self._nearby_search(lat, lng, search_radius, keyword)
-            except Exception as e:
-                self._log(f"[GoogleMaps] [WARN] Nearby search error: {e}")
-                continue
-
-            for item in results:
-                pid = item.get("place_id")
-                if not pid or not isinstance(pid, str):
-                    continue
-                if pid in seen_places:
-                    continue
-                seen_places.add(pid)
-                place_ids.append(pid)
-                if len(place_ids) >= self.max_places:
-                    break
-            if len(place_ids) >= self.max_places:
-                self._log(f"[GoogleMaps] Reached max_places={self.max_places}")
-                break
-
-        if not place_ids:
-            self._log("[GoogleMaps] Không tìm thấy địa điểm nào.")
-            return []
-
-        self._log(f"[GoogleMaps] Found places: {len(place_ids)}")
-
-        all_texts: List[str] = []
-        seen_texts: set[str] = set()
-
-        for idx, pid in enumerate(place_ids, start=1):
-            if self._stopped():
-                self._log("[GoogleMaps] Đã nhận lệnh DỪNG.")
-                break
-
-            try:
-                details = self._place_details(pid)
-            except Exception as e:
-                self._log(f"[GoogleMaps] [WARN] details error ({idx}/{len(place_ids)}): {e}")
-                continue
-
-            name = str(details.get("name", "")).strip()
-            reviews = details.get("reviews", [])
-            if not isinstance(reviews, list) or not reviews:
-                continue
-
-            raw_batch: List[str] = []
-            for rv in reviews[: self.max_reviews_per_place]:
-                if not isinstance(rv, dict):
-                    continue
-                text = str(rv.get("text", "")).strip()
-                if not text:
-                    continue
-                if name:
-                    text = f"{name}: {text}"
-                raw_batch.append(text)
-
-            if not raw_batch:
-                continue
-
-            processed_batch: List[str] = []
-            for text in raw_batch:
-                if self.preprocessor:
-                    result = self.preprocessor.process_comment(
-                        text,
-                        use_decoder=self.use_decoder,
-                        use_filter=self.use_filter,
-                        use_normalizer=self.use_normalizer,
-                        use_segmentor=self.use_segmentor,
-                    )
-                    if not result.get("is_valid", True):
-                        continue
-                    clean = result.get("cleaned_text", "")
-                else:
-                    clean = text
-
-                clean = str(clean).strip()
-                if clean and clean not in seen_texts:
-                    seen_texts.add(clean)
-                    processed_batch.append(clean)
-
-            if not processed_batch:
-                continue
-
-            all_texts.extend(processed_batch)
-            wh_rows = [{"text": t} for t in processed_batch]
-            wh_count = append_to_warehouse(wh_rows)
-            self._log(f"    [WAREHOUSE] +{wh_count} dòng (place {idx}/{len(place_ids)})")
-            if self.data_callback:
-                gui_batch = [
-                    {"id": i2, "text": t}
-                    for i2, t in enumerate(processed_batch, start=len(all_texts) - len(processed_batch) + 1)
-                ]
-                self.data_callback(gui_batch)
-
-        if all_texts:
-            add_keyword_to_history("google_maps", keyword)
-            self._log(f"[GoogleMaps] Đã thêm '{keyword}' vào lịch sử keyword.")
-
-        self._log(f"[GoogleMaps] Hoàn tất '{keyword}' – tổng {len(all_texts)} review.")
         return all_texts
 

@@ -8,7 +8,7 @@ import threading
 import customtkinter as ctk
 from tkinter import messagebox, ttk
 
-from crawler import extract_comments_stream, VOZCrawler, ThreadsCrawler, GoogleMapsCrawler, load_keyword_history
+from crawler import extract_comments_stream, VOZCrawler, ThreadsCrawler, load_keyword_history
 from nlp_pipeline.warehouse import append_to_warehouse, get_warehouse_count, read_warehouse, overwrite_warehouse
 from nlp_pipeline import VietnameseCommentPreprocessor
 from google_drive import upload_warehouse, download_warehouse, upload_labeled_data, download_labeled_data
@@ -282,7 +282,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(input_frame, text="Platform:").grid(row=0, column=2, padx=(10, 5), pady=10)
         self.kw_platform_var = ctk.StringVar(value="VOZ")
         self.kw_platform_menu = ctk.CTkOptionMenu(
-            input_frame, values=["VOZ", "Threads", "Google Maps"],
+            input_frame, values=["VOZ", "Threads"],
             variable=self.kw_platform_var, command=self._on_kw_platform_change, width=120
         )
         self.kw_platform_menu.grid(row=0, column=3, padx=(0, 10), pady=10)
@@ -308,27 +308,6 @@ class App(ctk.CTk):
         ctk.CTkLabel(self.kw_threads_frame, text="Max Scroll:").pack(side="left", padx=(0, 5))
         self.kw_max_scroll_var = ctk.StringVar(value="30")
         ctk.CTkEntry(self.kw_threads_frame, textvariable=self.kw_max_scroll_var, width=60).pack(side="left", padx=(0, 15))
-
-        # Google Maps params
-        self.kw_maps_frame = ctk.CTkFrame(param_frame, fg_color="transparent")
-        ctk.CTkLabel(self.kw_maps_frame, text="Center Lat:").pack(side="left", padx=(0, 5))
-        self.kw_maps_lat_var = ctk.StringVar(value="")
-        ctk.CTkEntry(self.kw_maps_frame, textvariable=self.kw_maps_lat_var, width=90).pack(side="left", padx=(0, 10))
-        ctk.CTkLabel(self.kw_maps_frame, text="Center Lng:").pack(side="left", padx=(0, 5))
-        self.kw_maps_lng_var = ctk.StringVar(value="")
-        ctk.CTkEntry(self.kw_maps_frame, textvariable=self.kw_maps_lng_var, width=90).pack(side="left", padx=(0, 10))
-        ctk.CTkLabel(self.kw_maps_frame, text="Radius(m):").pack(side="left", padx=(0, 5))
-        self.kw_maps_radius_var = ctk.StringVar(value="3000")
-        ctk.CTkEntry(self.kw_maps_frame, textvariable=self.kw_maps_radius_var, width=70).pack(side="left", padx=(0, 10))
-        ctk.CTkLabel(self.kw_maps_frame, text="Step(m):").pack(side="left", padx=(0, 5))
-        self.kw_maps_step_var = ctk.StringVar(value="1500")
-        ctk.CTkEntry(self.kw_maps_frame, textvariable=self.kw_maps_step_var, width=70).pack(side="left", padx=(0, 10))
-        ctk.CTkLabel(self.kw_maps_frame, text="Max Places:").pack(side="left", padx=(0, 5))
-        self.kw_maps_max_places_var = ctk.StringVar(value="200")
-        ctk.CTkEntry(self.kw_maps_frame, textvariable=self.kw_maps_max_places_var, width=70).pack(side="left", padx=(0, 10))
-        ctk.CTkLabel(self.kw_maps_frame, text="Max Reviews/Place:").pack(side="left", padx=(0, 5))
-        self.kw_maps_max_reviews_var = ctk.StringVar(value="5")
-        ctk.CTkEntry(self.kw_maps_frame, textvariable=self.kw_maps_max_reviews_var, width=60).pack(side="left", padx=(0, 10))
 
         # Show VOZ params by default
         self.kw_voz_frame.pack(side="left")
@@ -440,33 +419,19 @@ class App(ctk.CTk):
         self.refresh_keyword_history()
 
     def _on_kw_platform_change(self, platform):
-        # Hide all param frames then show selected
-        try:
-            self.kw_voz_frame.pack_forget()
-        except Exception:
-            pass
-        try:
-            self.kw_threads_frame.pack_forget()
-        except Exception:
-            pass
-        try:
-            self.kw_maps_frame.pack_forget()
-        except Exception:
-            pass
-
         if platform == "VOZ":
+            self.kw_threads_frame.pack_forget()
             self.kw_voz_frame.pack(side="left")
-        elif platform == "Threads":
-            self.kw_threads_frame.pack(side="left")
         else:
-            self.kw_maps_frame.pack(side="left")
+            self.kw_voz_frame.pack_forget()
+            self.kw_threads_frame.pack(side="left")
 
     def refresh_keyword_history(self):
         for item in self.kw_history_tree.get_children():
             self.kw_history_tree.delete(item)
         try:
             history = load_keyword_history()
-            for platform in ["voz", "threads", "google_maps"]:
+            for platform in ["voz", "threads"]:
                 for kw in history.get(platform, []):
                     self.kw_history_tree.insert("", "end", values=(platform.upper(), kw))
         except Exception:
@@ -545,12 +510,6 @@ class App(ctk.CTk):
         max_pages,
         max_posts,
         max_scroll,
-        maps_lat="",
-        maps_lng="",
-        maps_radius="3000",
-        maps_step="1500",
-        maps_max_places="200",
-        maps_max_reviews="5",
     ):
         crawler = None
         try:
@@ -586,29 +545,11 @@ class App(ctk.CTk):
                         use_normalizer=u_nor,
                         use_segmentor=use_segmentor,
                     )
-                elif platform == "Threads":
+                else:
                     crawler = ThreadsCrawler(
                         keyword=keyword,
                         max_posts=max_posts,
                         max_scroll=max_scroll,
-                        log_callback=log_cb,
-                        stop_event=self.kw_stop_event,
-                        data_callback=self.kw_handle_new_data,
-                        preprocessor=preprocessor,
-                        use_decoder=u_dec,
-                        use_filter=u_fil,
-                        use_normalizer=u_nor,
-                        use_segmentor=use_segmentor,
-                    )
-                else:
-                    crawler = GoogleMapsCrawler(
-                        keyword=keyword,
-                        center_lat=float(maps_lat),
-                        center_lng=float(maps_lng),
-                        radius_m=int(maps_radius),
-                        grid_step_m=int(maps_step),
-                        max_places=int(maps_max_places),
-                        max_reviews_per_place=int(maps_max_reviews),
                         log_callback=log_cb,
                         stop_event=self.kw_stop_event,
                         data_callback=self.kw_handle_new_data,
@@ -679,31 +620,6 @@ class App(ctk.CTk):
         max_posts = int(self.kw_max_posts_var.get() or 10)
         max_scroll = int(self.kw_max_scroll_var.get() or 30)
 
-        # Google Maps params (used only when platform == "Google Maps")
-        maps_lat = self.kw_maps_lat_var.get().strip() if hasattr(self, "kw_maps_lat_var") else ""
-        maps_lng = self.kw_maps_lng_var.get().strip() if hasattr(self, "kw_maps_lng_var") else ""
-        maps_radius = self.kw_maps_radius_var.get().strip() if hasattr(self, "kw_maps_radius_var") else "3000"
-        maps_step = self.kw_maps_step_var.get().strip() if hasattr(self, "kw_maps_step_var") else "1500"
-        maps_max_places = self.kw_maps_max_places_var.get().strip() if hasattr(self, "kw_maps_max_places_var") else "200"
-        maps_max_reviews = self.kw_maps_max_reviews_var.get().strip() if hasattr(self, "kw_maps_max_reviews_var") else "5"
-
-        if platform == "Google Maps":
-            if not maps_lat or not maps_lng:
-                messagebox.showwarning("Lỗi", "Vui lòng nhập Center Lat/Lng cho Google Maps!")
-                self._set_kw_gui_state(False)
-                return
-            try:
-                float(maps_lat)
-                float(maps_lng)
-                int(maps_radius)
-                int(maps_step)
-                int(maps_max_places)
-                int(maps_max_reviews)
-            except ValueError:
-                messagebox.showwarning("Lỗi", "Google Maps params không hợp lệ (Lat/Lng là số thực, còn lại là số nguyên).")
-                self._set_kw_gui_state(False)
-                return
-
         self.kw_extracted_data = []
         self.kw_tree_data.delete(*self.kw_tree_data.get_children())
         self.kw_log_textbox.configure(state="normal")
@@ -720,8 +636,7 @@ class App(ctk.CTk):
         thread = threading.Thread(
             target=self._keyword_crawl_thread,
             args=(keywords, platform, u_dec, u_fil, u_nor, use_segmentor, preprocessor,
-                  max_threads, max_pages, max_posts, max_scroll,
-                  maps_lat, maps_lng, maps_radius, maps_step, maps_max_places, maps_max_reviews),
+                  max_threads, max_pages, max_posts, max_scroll),
             daemon=True,
         )
         thread.start()
