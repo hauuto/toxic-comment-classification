@@ -37,8 +37,25 @@ def _load_existing_ids(output_path: str) -> set[int]:
         return set()
 
     ids: set[int] = set()
+    encodings = ["utf-8-sig", "utf-8", "cp1258", "cp1252", "latin-1"]
+    for enc in encodings:
+        try:
+            with open(output_path, "r", encoding=enc, newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        ids.add(int(row.get("id", "0")))
+                    except Exception:
+                        continue
+            return ids
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            return set()
+
+    # Last resort: best-effort parse with replacement
     try:
-        with open(output_path, "r", encoding="utf-8-sig", newline="") as f:
+        with open(output_path, "r", encoding="utf-8", errors="replace", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:

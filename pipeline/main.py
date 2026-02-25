@@ -6,6 +6,7 @@ import json
 import re
 import threading
 import concurrent.futures
+import shutil
 from datetime import datetime, timezone
 import customtkinter as ctk
 from tkinter import messagebox, ttk
@@ -178,6 +179,147 @@ class App(ctk.CTk):
             pp = VietnameseCommentPreprocessor(segmentor_backend="vncorenlp", vncorenlp_dir=models_dir)
         self._preprocessor_cache["vncorenlp"] = pp
         return pp
+
+    # ---------------------------------------------------------
+    # CSV helpers (robust encoding)
+    # ---------------------------------------------------------
+    @staticmethod
+    def _read_csv_dicts_with_fallback(path: str) -> tuple[list[dict], list[str], str]:
+        """Read a CSV file into list[dict] with encoding fallback.
+
+        Returns: (rows, fieldnames, encoding_used)
+        """
+        encodings = ["utf-8-sig", "utf-8", "cp1258", "cp1252", "latin-1"]
+        last_err: Exception | None = None
+        for enc in encodings:
+            try:
+                with open(path, "r", encoding=enc, newline="") as f:
+                    reader = csv.DictReader(f)
+                    rows = list(reader)
+                    fieldnames = list(reader.fieldnames or [])
+                return rows, fieldnames, enc
+            except UnicodeDecodeError as e:
+                last_err = e
+                continue
+            except Exception as e:
+                # Non-decoding errors shouldn't be masked by fallback.
+                raise e
+
+        # Last resort: replace invalid bytes to avoid crashing UI.
+        _ = last_err
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            fieldnames = list(reader.fieldnames or [])
+        return rows, fieldnames, "utf-8(replace)"
+
+    @staticmethod
+    def _backup_file(path: str) -> str:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        bak_path = f"{path}.bak_{ts}"
+        try:
+            shutil.copy2(path, bak_path)
+        except Exception:
+            # Best-effort backup
+            pass
+        return bak_path
+
+    @staticmethod
+    def _looks_mojibake(s: str) -> bool:
+        # Common UTF-8->cp1252/latin1 mojibake fragments seen in Vietnamese text.
+        patterns = ("ï»¿", "Ã", "Â", "Ä", "áº", "Æ°", "â€")
+        return any(p in s for p in patterns)
+
+    @staticmethod
+    def _fix_mojibake_text(s: str) -> str:
+        # Try to undo UTF-8 bytes that were incorrectly decoded as latin-1/cp1252 and then re-encoded.
+        # This is safe because it only applies when s is encodable in latin-1.
+        out = s
+        for _ in range(2):
+            if not App._looks_mojibake(out):
+                break
+            try:
+                out2 = out.encode("latin-1").decode("utf-8")
+            except Exception:
+                break
+            if out2 == out:
+                break
+            out = out2
+        return out
+
+    @staticmethod
+    def _normalize_fieldname(name: str) -> str:
+        # Strip BOM and whitespace. Some tools may embed BOM (U+FEFF) into the header name.
+        return (name or "").replace("\ufeff", "").strip()
+
+    @staticmethod
+    def _sanitize_csv_row(row: dict) -> dict:
+        # DictReader stores extra columns under key None.
+        if row is None:
+            return {}
+        if None in row:
+            try:
+                row = dict(row)
+                row.pop(None, None)
+            except Exception:
+                return {}
+
+        cleaned: dict[str, str] = {}
+        for k, v in row.items():
+            if k is None:
+                continue
+            key = str(k)
+            if App._looks_mojibake(key):
+                key = App._fix_mojibake_text(key)
+            key = App._normalize_fieldname(key)
+            if not key:
+                continue
+
+            if v is None:
+                cleaned[key] = ""
+            else:
+                val = str(v)
+                if App._looks_mojibake(val):
+                    val = App._fix_mojibake_text(val)
+                cleaned[key] = val
+        return cleaned
+
+    @staticmethod
+    def _rewrite_csv_utf8sig(path: str, rows: list[dict], fieldnames: list[str]) -> None:
+        sanitized_rows: list[dict] = []
+        for r in rows:
+            if isinstance(r, dict):
+                sanitized_rows.append(App._sanitize_csv_row(r))
+
+        if not fieldnames:
+            # Infer from sanitized rows
+            keys: list[str] = []
+            seen: set[str] = set()
+            for r in sanitized_rows:
+                for k in r.keys():
+                    if k not in seen:
+                        seen.add(k)
+                        keys.append(k)
+            fieldnames = keys
+        else:
+            normalized: list[str] = []
+            for fn in fieldnames:
+                if fn is None:
+                    continue
+                name = str(fn)
+                if App._looks_mojibake(name):
+                    name = App._fix_mojibake_text(name)
+                name = App._normalize_fieldname(name)
+                if name:
+                    normalized.append(name)
+            fieldnames = normalized
+            fieldnames = [fn for fn in fieldnames if fn]
+
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for r in sanitized_rows:
+                writer.writerow(r)
 
     # ---------------------------------------------------------
     # TAB 1: CRAWLER
@@ -1382,28 +1524,34 @@ class App(ctk.CTk):
 
             if os.path.exists(labeled_path):
                 try:
-                    with open(labeled_path, "r", encoding="utf-8-sig") as f:
-                        reader = csv.DictReader(f)
-                        for erow in reader:
-                            try:
-                                eid = int(erow.get("id", 0))
-                            except (ValueError, TypeError):
-                                eid = 0
-                            labeled_ids.add(eid)
-                            existing_rows.append(erow)
-                            # Rebuild label_counts from existing data
-                            t1 = erow.get("tier1_spam", "")
-                            t2 = erow.get("tier2_toxic", "")
-                            t3_str = erow.get("tier3_labels", "")
-                            if t1:
-                                label_counts[t1] = label_counts.get(t1, 0) + 1
-                            if t2:
-                                label_counts[t2] = label_counts.get(t2, 0) + 1
-                            if t3_str:
-                                for lbl in t3_str.split("|"):
-                                    lbl = lbl.strip()
-                                    if lbl:
-                                        label_counts[lbl] = label_counts.get(lbl, 0) + 1
+                    raw_rows, fieldnames, enc_used = self._read_csv_dicts_with_fallback(labeled_path)
+                    # If file is legacy encoding (e.g., cp1258), convert once to utf-8-sig to prevent future errors.
+                    if enc_used not in ("utf-8-sig", "utf-8", "utf-8(replace)"):
+                        self._backup_file(labeled_path)
+                        self._rewrite_csv_utf8sig(labeled_path, raw_rows, fieldnames)
+                        # Re-read using utf-8-sig for consistency
+                        raw_rows, fieldnames, enc_used = self._read_csv_dicts_with_fallback(labeled_path)
+
+                    for erow in raw_rows:
+                        try:
+                            eid = int(erow.get("id", 0))
+                        except (ValueError, TypeError):
+                            eid = 0
+                        labeled_ids.add(eid)
+                        existing_rows.append(erow)
+                        # Rebuild label_counts from existing data
+                        t1 = erow.get("tier1_spam", "")
+                        t2 = erow.get("tier2_toxic", "")
+                        t3_str = erow.get("tier3_labels", "")
+                        if t1:
+                            label_counts[t1] = label_counts.get(t1, 0) + 1
+                        if t2:
+                            label_counts[t2] = label_counts.get(t2, 0) + 1
+                        if t3_str:
+                            for lbl in str(t3_str).split("|"):
+                                lbl = lbl.strip()
+                                if lbl:
+                                    label_counts[lbl] = label_counts.get(lbl, 0) + 1
                     file_exists = len(labeled_ids) > 0
                 except Exception:
                     pass
@@ -1785,29 +1933,56 @@ class App(ctk.CTk):
         self._lm_all_rows = []
         if os.path.isfile(labeled_path):
             try:
-                with open(labeled_path, "r", encoding="utf-8-sig") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        # New 3-tier format
-                        if "tier1_spam" in row:
-                            self._lm_all_rows.append({
-                                "id": row.get("id", ""),
-                                "text": row.get("text", ""),
-                                "tier1_spam": row.get("tier1_spam", "Not Spam"),
-                                "tier2_toxic": row.get("tier2_toxic", "Clean"),
-                                "tier3_labels": row.get("tier3_labels", ""),
-                            })
-                        else:
-                            # Backward compatibility: migrate old format (id, text, label)
-                            old_label = row.get("label", "Clean")
-                            t1, t2, t3 = self._migrate_old_label(old_label)
-                            self._lm_all_rows.append({
-                                "id": row.get("id", ""),
-                                "text": row.get("text", ""),
-                                "tier1_spam": t1,
-                                "tier2_toxic": t2,
-                                "tier3_labels": t3,
-                            })
+                raw_rows, fieldnames, enc_used = self._read_csv_dicts_with_fallback(labeled_path)
+                # Auto-convert only when we are reasonably confident (cp1258/cp1252).
+                # Avoid destructive conversions from latin-1 or utf-8(replace).
+                if enc_used in ("cp1258", "cp1252"):
+                    bak = self._backup_file(labeled_path)
+                    self._rewrite_csv_utf8sig(labeled_path, raw_rows, fieldnames)
+                    self.lm_status_label.configure(text=f"Đã sửa encoding (backup: {os.path.basename(bak)})", text_color="orange")
+                    raw_rows, fieldnames, enc_used = self._read_csv_dicts_with_fallback(labeled_path)
+
+                # If file content looks like mojibake (double-encoded), repair once.
+                need_repair = False
+                for r in raw_rows[:200]:
+                    if not isinstance(r, dict):
+                        continue
+                    for v in r.values():
+                        if isinstance(v, str) and self._looks_mojibake(v):
+                            need_repair = True
+                            break
+                    if need_repair:
+                        break
+
+                if need_repair:
+                    bak = self._backup_file(labeled_path)
+                    self._rewrite_csv_utf8sig(labeled_path, raw_rows, fieldnames)
+                    self.lm_status_label.configure(text=f"Đã repair chữ Việt (backup: {os.path.basename(bak)})", text_color="orange")
+                    raw_rows, fieldnames, enc_used = self._read_csv_dicts_with_fallback(labeled_path)
+
+                for row in raw_rows:
+                    if isinstance(row, dict):
+                        row = self._sanitize_csv_row(row)
+                    # New 3-tier format
+                    if "tier1_spam" in row:
+                        self._lm_all_rows.append({
+                            "id": row.get("id", ""),
+                            "text": row.get("text", ""),
+                            "tier1_spam": row.get("tier1_spam", "Not Spam"),
+                            "tier2_toxic": row.get("tier2_toxic", "Clean"),
+                            "tier3_labels": row.get("tier3_labels", ""),
+                        })
+                    else:
+                        # Backward compatibility: migrate old format (id, text, label)
+                        old_label = row.get("label", "Clean")
+                        t1, t2, t3 = self._migrate_old_label(str(old_label))
+                        self._lm_all_rows.append({
+                            "id": row.get("id", ""),
+                            "text": row.get("text", ""),
+                            "tier1_spam": t1,
+                            "tier2_toxic": t2,
+                            "tier3_labels": t3,
+                        })
             except Exception as e:
                 messagebox.showerror("Lỗi", f"Không thể đọc labeled_data.csv: {e}")
         self._lm_display_rows(self._lm_all_rows)
