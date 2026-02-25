@@ -211,6 +211,7 @@ __marimo__/
 data/
 credentials.json
 token.json
+pipeline/cluster_history.json
 
 
 #Crawler chrome profile ignore

@@ -5,11 +5,20 @@ import time
 import json
 import re
 import threading
+from datetime import datetime, timezone
 import customtkinter as ctk
 from tkinter import messagebox, ttk
 
 from crawler import extract_comments_stream, VOZCrawler, ThreadsCrawler, load_keyword_history
-from nlp_pipeline.warehouse import append_to_warehouse, get_warehouse_count, read_warehouse, overwrite_warehouse
+from nlp_pipeline.warehouse import (
+    append_to_warehouse,
+    get_warehouse_count,
+    get_warehouse_clusters,
+    read_warehouse,
+    read_warehouse_cluster,
+    overwrite_warehouse,
+    CLUSTER_SIZE_DEFAULT,
+)
 from nlp_pipeline import VietnameseCommentPreprocessor
 from google_drive import upload_warehouse, download_warehouse, upload_labeled_data, download_labeled_data
 from lmstudio_classifier import (LMStudioClassifier, TIER1_LABELS, TIER2_LABELS,
@@ -763,6 +772,10 @@ class App(ctk.CTk):
         self._wh_display_rows(self._wh_all_rows)
         self.wh_stats_label.configure(text=f"Warehouse: {len(self._wh_all_rows)} dòng")
         self.wh_status_label.configure(text=f"Đã tải {len(self._wh_all_rows)} dòng từ warehouse.csv", text_color="green")
+        try:
+            self._lbl_refresh_clusters()
+        except Exception:
+            pass
 
     def _wh_display_rows(self, rows):
         """Populate the treeview with a list of row dicts."""
@@ -810,6 +823,10 @@ class App(ctk.CTk):
         removed = count_before - len(self._wh_all_rows)
         self.wh_stats_label.configure(text=f"Warehouse: {len(self._wh_all_rows)} dòng")
         self.wh_status_label.configure(text=f"Đã xóa {removed} dòng.", text_color="orange")
+        try:
+            self._lbl_refresh_clusters()
+        except Exception:
+            pass
 
     def wh_remove_duplicates(self):
         """Remove duplicate texts from warehouse."""
@@ -832,6 +849,10 @@ class App(ctk.CTk):
         self._wh_display_rows(self._wh_all_rows)
         self.wh_stats_label.configure(text=f"Warehouse: {len(self._wh_all_rows)} dòng")
         self.wh_status_label.configure(text=f"Đã xóa {removed} dòng trùng lặp.", text_color="green")
+        try:
+            self._lbl_refresh_clusters()
+        except Exception:
+            pass
 
     def wh_export_csv(self):
         """Export current warehouse data to a timestamped CSV."""
@@ -912,6 +933,7 @@ class App(ctk.CTk):
                 self.after(0, lambda: self.wh_status_label.configure(
                     text=f"Hoàn tất! Giữ {len(kept)}/{total} dòng (loại {removed_count} dòng).",
                     text_color="green"))
+                self.after(0, lambda: self._lbl_refresh_clusters())
             except Exception as e:
                 self.after(0, lambda: self.wh_status_label.configure(
                     text=f"Lỗi: {str(e)}", text_color="red"))
@@ -1037,6 +1059,18 @@ class App(ctk.CTk):
         self.lbl_batch_var = ctk.StringVar(value="5")
         ctk.CTkEntry(ctrl_frame, textvariable=self.lbl_batch_var, width=60).pack(side="left", padx=(0, 15))
 
+        # Cluster selector (25k rows per cluster)
+        ctk.CTkLabel(ctrl_frame, text="Cluster:").pack(side="left", padx=(5, 5))
+        self.lbl_cluster_var = ctk.StringVar(value="")
+        self.lbl_cluster_menu = ctk.CTkOptionMenu(
+            ctrl_frame,
+            values=["(đang tải...)"] ,
+            variable=self.lbl_cluster_var,
+            command=self._lbl_on_cluster_change,
+            width=210,
+        )
+        self.lbl_cluster_menu.pack(side="left", padx=(0, 15))
+
         self.lbl_start_btn = ctk.CTkButton(ctrl_frame, text="▶ Bắt Đầu Gán Nhãn", width=160,
                                             fg_color="#2563EB", hover_color="#1D4ED8",
                                             command=self._lbl_start_labeling)
@@ -1099,11 +1133,116 @@ class App(ctk.CTk):
         self._lbl_is_running = False
         self._lbl_stop_event = threading.Event()
 
+        # Init cluster options
+        self._lbl_cluster_size = CLUSTER_SIZE_DEFAULT
+        self._lbl_cluster_options: dict[str, dict] = {}
+        self._lbl_refresh_clusters()
+
     def _lbl_log(self, msg):
         self.lbl_log_textbox.configure(state="normal")
         self.lbl_log_textbox.insert("end", f"{msg}\n")
         self.lbl_log_textbox.see("end")
         self.lbl_log_textbox.configure(state="disabled")
+
+    def _lbl_cluster_history_path(self) -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "cluster_history.json")
+
+    def _lbl_load_cluster_history(self) -> dict:
+        path = self._lbl_cluster_history_path()
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _lbl_save_cluster_history(self, data: dict) -> None:
+        path = self._lbl_cluster_history_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _lbl_refresh_clusters(self):
+        """Recompute cluster list from current warehouse.csv and refresh the dropdown."""
+        try:
+            clusters = get_warehouse_clusters(cluster_size=self._lbl_cluster_size)
+        except Exception:
+            clusters = []
+
+        options: dict[str, dict] = {}
+        values: list[str] = []
+        for c in clusters:
+            idx = int(c.get("cluster_index", 0))
+            start_row = int(c.get("start_row", 0))
+            end_row = int(c.get("end_row", 0))
+            size = int(c.get("size", 0))
+            # IDs are typically 1-based sequential after overwrite/append.
+            start_id = start_row + 1
+            end_id = end_row + 1
+            label = f"Cluster {idx + 1} ({start_id}–{end_id}) — {size}"
+            options[label] = {"cluster_index": idx, "start_id": start_id, "end_id": end_id, "size": size}
+            values.append(label)
+
+        if not values:
+            values = ["(warehouse trống)"]
+            options = {values[0]: {"cluster_index": 0, "start_id": 0, "end_id": 0, "size": 0}}
+
+        self._lbl_cluster_options = options
+        try:
+            self.lbl_cluster_menu.configure(values=values)
+        except Exception:
+            return
+
+        # Restore last selection if possible
+        history = self._lbl_load_cluster_history()
+        last_idx = history.get("last_selected_cluster_index", 0)
+        if not isinstance(last_idx, int):
+            last_idx = 0
+
+        # Pick selection
+        selected = None
+        for text, meta in options.items():
+            if int(meta.get("cluster_index", 0)) == last_idx:
+                selected = text
+                break
+        if selected is None:
+            selected = values[0]
+
+        try:
+            self.lbl_cluster_var.set(selected)
+        except Exception:
+            pass
+
+    def _lbl_on_cluster_change(self, selected_value: str):
+        meta = self._lbl_cluster_options.get(selected_value, {})
+        idx = int(meta.get("cluster_index", 0)) if meta else 0
+
+        history = self._lbl_load_cluster_history()
+        history["cluster_size"] = int(self._lbl_cluster_size)
+        history["last_selected_cluster_index"] = idx
+
+        recent = history.get("recent", [])
+        if not isinstance(recent, list):
+            recent = []
+        recent.append(
+            {
+                "cluster_index": idx,
+                "selected_at": datetime.now(timezone.utc).isoformat(),
+                "warehouse_rows": get_warehouse_count(),
+            }
+        )
+        history["recent"] = recent[-30:]
+        self._lbl_save_cluster_history(history)
+
+        if meta and meta.get("size", 0):
+            self.lbl_status_label.configure(
+                text=f"Trạng thái: Đã chọn Cluster {idx + 1} ({meta.get('start_id')}–{meta.get('end_id')})",
+                text_color="gray",
+            )
 
     def _lbl_test_connection(self):
         gemini_enabled = bool(os.getenv("GEMINI_API_KEY", "").strip())
@@ -1159,7 +1298,12 @@ class App(ctk.CTk):
             if not base_url:
                 messagebox.showwarning("Lỗi", "Vui lòng nhập endpoint!")
                 return
-        rows = read_warehouse()
+        # Select cluster
+        selected_cluster_text = (self.lbl_cluster_var.get() or "").strip()
+        selected_meta = self._lbl_cluster_options.get(selected_cluster_text, {})
+        cluster_index = int(selected_meta.get("cluster_index", 0)) if selected_meta else 0
+
+        rows = read_warehouse_cluster(cluster_index=cluster_index, cluster_size=self._lbl_cluster_size)
         if not rows:
             messagebox.showwarning("Lỗi", "Warehouse trống! Hãy crawl dữ liệu trước.")
             return
@@ -1186,6 +1330,10 @@ class App(ctk.CTk):
         self.lbl_model_entry.configure(state="disabled")
 
         self._lbl_log(f"🚀 Bắt đầu gán nhãn {len(rows)} bình luận")
+        if selected_meta and selected_meta.get("size", 0):
+            self._lbl_log(
+                f"   Cluster: {cluster_index + 1} ({selected_meta.get('start_id')}–{selected_meta.get('end_id')})"
+            )
         if gemini_enabled:
             self._lbl_log("   Provider: Gemini (Google AI Studio)")
             self._lbl_log(f"   Model: {effective_model}")
@@ -1240,12 +1388,25 @@ class App(ctk.CTk):
                 except Exception:
                     pass
 
-            skipped = len(labeled_ids)
             total = len(rows)
 
-            # Pre-populate treeview with existing labeled rows
+            # Cluster-scoped resume: only count/pre-fill rows belonging to current cluster
+            cluster_ids = set(r.get("id", 0) for r in rows)
+            existing_rows_cluster = []
             if existing_rows:
                 for erow in existing_rows:
+                    try:
+                        eid = int(erow.get("id", 0))
+                    except Exception:
+                        continue
+                    if eid in cluster_ids:
+                        existing_rows_cluster.append(erow)
+
+            skipped = len(existing_rows_cluster)
+
+            # Pre-populate treeview with existing labeled rows (current cluster only)
+            if existing_rows_cluster:
+                for erow in existing_rows_cluster:
                     rid = erow.get("id", "")
                     dt = str(erow.get("text", "")).replace("\n", "  ")[:80]
                     s1 = erow.get("tier1_spam", "")
@@ -1280,7 +1441,7 @@ class App(ctk.CTk):
             # Update progress to reflect already-labeled rows
             processed = skipped
             if skipped > 0:
-                p = skipped / total
+                p = (skipped / total) if total else 0
                 self.after(0, lambda v=p: self.lbl_progress.set(v))
                 self.after(0, lambda v=skipped, t=total: self.lbl_progress_text.configure(text=f"{v} / {t}"))
 
@@ -2169,6 +2330,7 @@ class App(ctk.CTk):
         # Also append to warehouse.csv
         try:
             append_to_warehouse(batch)
+            self.after(0, self._lbl_refresh_clusters)
         except Exception as e:
             self.after(0, self.log_message, f"Lỗi ghi warehouse: {e}")
         self.extracted_data.extend(batch)

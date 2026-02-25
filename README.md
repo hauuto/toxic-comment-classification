@@ -27,6 +27,9 @@ GEMINI_MODEL=gemini-2.0-flash
 ### 2) Chạy GUI (pipeline)
 - Tab Labeling sẽ tự dùng Gemini khi có `GEMINI_API_KEY`.
 - Nếu không có `GEMINI_API_KEY` thì giữ nguyên fallback sang LM Studio như trước.
+- Dữ liệu warehouse được chia thành cluster theo thứ tự từ trên xuống: **25.000 dòng = 1 cluster**.
+- Chọn cluster trong tab Labeling để chỉ gán nhãn đúng cluster đó.
+- Lịch sử cluster được lưu tại `pipeline/cluster_history.json`.
 
 ### 3) Chạy CLI Gemini 3-tier
 ```
