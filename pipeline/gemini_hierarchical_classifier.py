@@ -51,8 +51,9 @@ Classify as exactly one of: "Spam" or "Not Spam".
 
 ### Tier 2 – Toxic Check (INDEPENDENT from Tier 1)
 Classify as exactly one of: "Toxic" or "Clean".
-- "Toxic": contains harmful, offensive, or inappropriate content.
-- "Clean": normal, non-harmful content.
+"Toxic": content that includes insults, harassment, threats, profanity, or hate speech targeting a person or group.
+"Toxic" requires abusive or aggressive intent.
+"Clean": criticism, negative opinions, or complaints without insults or abusive language.
 IMPORTANT: A comment can be both "Spam" AND "Toxic", or "Spam" AND "Clean". Tier 1 and Tier 2 are independent.
 
 ### Tier 3 – Multi-label (DEPENDS on Tier 2)
@@ -73,6 +74,15 @@ Reply with ONLY a JSON object with this exact shape:
   {"tier1_spam": "Spam"|"Not Spam", "tier2_toxic": "Toxic"|"Clean", "tier3_labels": ["...", ...]},
   ...
 ]}
+
+General Rules:
+- Evaluate tiers independently but logically consistent.
+- If Tier 2 = "Toxic", Tier 3 MUST contain at least one toxic label.
+- If Tier 2 = "Clean", Tier 3 MUST contain at least one clean label.
+- Toxic classification overrides sentiment classification.
+- Do not classify something as Spam based only on being short.
+- Criticism without insult = Clean + Negative.
+- Profanity automatically qualifies as Obscene (Toxic).
 
 - "items" must be an array with one object per input comment, in the same order.
 - Do NOT add any explanation, numbering, markdown, or extra text outside the JSON."""
