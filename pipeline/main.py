@@ -885,6 +885,11 @@ class App(ctk.CTk):
                                            state="disabled", command=self._lbl_stop_labeling)
         self.lbl_stop_btn.pack(side="left", padx=5)
 
+        self.lbl_reset_btn = ctk.CTkButton(ctrl_frame, text="🔄 Reset", width=80,
+                                            fg_color="#6B7280", hover_color="#4B5563",
+                                            command=self._lbl_reset_labeled_data)
+        self.lbl_reset_btn.pack(side="left", padx=5)
+
         self.lbl_progress_var = ctk.DoubleVar(value=0.0)
         self.lbl_progress = ctk.CTkProgressBar(ctrl_frame, variable=self.lbl_progress_var, width=250)
         self.lbl_progress.pack(side="left", padx=(15, 5))
@@ -990,6 +995,7 @@ class App(ctk.CTk):
         self._lbl_is_running = True
         self.lbl_start_btn.configure(state="disabled", text="Đang chạy...")
         self.lbl_stop_btn.configure(state="normal")
+        self.lbl_reset_btn.configure(state="disabled")
         self.lbl_endpoint_entry.configure(state="disabled")
         self.lbl_model_entry.configure(state="disabled")
 
@@ -1004,15 +1010,87 @@ class App(ctk.CTk):
             import pandas as pd
             classifier = LMStudioClassifier(endpoint=endpoint, model=model_name, timeout=120)
             labeled_path = self._get_labeled_data_path()
+
+            # --- Load existing labeled data for resume support ---
+            labeled_ids = set()
+            existing_rows = []
+            label_counts = {}
+            file_exists = False
+
             if os.path.exists(labeled_path):
                 try:
-                    os.remove(labeled_path)
+                    with open(labeled_path, "r", encoding="utf-8-sig") as f:
+                        reader = csv.DictReader(f)
+                        for erow in reader:
+                            try:
+                                eid = int(erow.get("id", 0))
+                            except (ValueError, TypeError):
+                                eid = 0
+                            labeled_ids.add(eid)
+                            existing_rows.append(erow)
+                            # Rebuild label_counts from existing data
+                            t1 = erow.get("tier1_spam", "")
+                            t2 = erow.get("tier2_toxic", "")
+                            t3_str = erow.get("tier3_labels", "")
+                            if t1:
+                                label_counts[t1] = label_counts.get(t1, 0) + 1
+                            if t2:
+                                label_counts[t2] = label_counts.get(t2, 0) + 1
+                            if t3_str:
+                                for lbl in t3_str.split("|"):
+                                    lbl = lbl.strip()
+                                    if lbl:
+                                        label_counts[lbl] = label_counts.get(lbl, 0) + 1
+                    file_exists = len(labeled_ids) > 0
                 except Exception:
                     pass
-            file_exists = False
+
+            skipped = len(labeled_ids)
             total = len(rows)
-            processed = 0
-            label_counts = {}
+
+            # Pre-populate treeview with existing labeled rows
+            if existing_rows:
+                for erow in existing_rows:
+                    rid = erow.get("id", "")
+                    dt = str(erow.get("text", "")).replace("\n", "  ")[:80]
+                    s1 = erow.get("tier1_spam", "")
+                    s2 = erow.get("tier2_toxic", "")
+                    s3 = erow.get("tier3_labels", "")
+                    self.after(0, lambda r=rid, d=dt, a1=s1, a2=s2, a3=s3:
+                               self.lbl_tree.insert("", "end", values=(r, d, a1, a2, a3)))
+                self.after(0, self._lbl_log,
+                           f"♻ Tiếp tục từ {skipped}/{total} dòng đã gán nhãn trước đó")
+
+            # Filter pending rows (skip already labeled)
+            pending_rows = [r for r in rows if r.get("id") not in labeled_ids]
+
+            if not pending_rows:
+                self.after(0, self._lbl_log, f"✅ Tất cả {total} dòng đã được gán nhãn. Không cần làm gì thêm.")
+                stats_str = " | ".join(f"{k}: {v}" for k, v in label_counts.items())
+                if stats_str:
+                    self.after(0, self._lbl_log, f"   Thống kê: [{stats_str}]")
+                self.after(0, lambda: self.lbl_progress.set(1.0))
+                self.after(0, lambda t=total: self.lbl_progress_text.configure(text=f"{t} / {t}"))
+                final_msg = f"✅ Hoàn tất — {total} dòng đã gán nhãn → labeled_data.csv"
+                self.after(0, lambda: self.lbl_status_label.configure(text=final_msg, text_color="green"))
+                self._lbl_is_running = False
+                self.after(0, lambda: self.lbl_start_btn.configure(state="normal", text="▶ Bắt Đầu Gán Nhãn"))
+                self.after(0, lambda: self.lbl_stop_btn.configure(state="disabled"))
+                self.after(0, lambda: self.lbl_reset_btn.configure(state="normal"))
+                self.after(0, lambda: self.lbl_endpoint_entry.configure(state="normal"))
+                self.after(0, lambda: self.lbl_model_entry.configure(state="normal"))
+                self.after(0, self.refresh_file_list)
+                return
+
+            # Update progress to reflect already-labeled rows
+            processed = skipped
+            if skipped > 0:
+                p = skipped / total
+                self.after(0, lambda v=p: self.lbl_progress.set(v))
+                self.after(0, lambda v=skipped, t=total: self.lbl_progress_text.configure(text=f"{v} / {t}"))
+
+            self.after(0, self._lbl_log, f"📋 Còn {len(pending_rows)} dòng cần gán nhãn")
+
             buffer_rows = []
             buffer_tasks = []
 
@@ -1050,7 +1128,7 @@ class App(ctk.CTk):
                 self.after(0, self._lbl_log, f"   ✓ Batch xong. [{stats_str}]")
 
             try:
-                for row in rows:
+                for row in pending_rows:
                     if self._lbl_stop_event.is_set():
                         self.after(0, self._lbl_log, "🛑 Đã nhận lệnh DỪNG. Dữ liệu đã gán được lưu.")
                         break
@@ -1065,12 +1143,13 @@ class App(ctk.CTk):
                 if buffer_tasks and not self._lbl_stop_event.is_set():
                     self.after(0, self._lbl_log, f"📤 Gửi batch cuối {processed + 1}–{processed + len(buffer_tasks)} / {total} ...")
                     _flush_batch()
+                newly_labeled = processed - skipped
                 self.after(0, self._lbl_log, "\n" + "=" * 50)
-                self.after(0, self._lbl_log, f"✅ HOÀN TẤT: {processed}/{total} bình luận đã gán nhãn")
+                self.after(0, self._lbl_log, f"✅ HOÀN TẤT: {processed}/{total} bình luận đã gán nhãn ({newly_labeled} mới gán)")
                 for lbl, cnt in label_counts.items():
                     self.after(0, self._lbl_log, f"   {lbl}: {cnt}")
                 self.after(0, self._lbl_log, f"📂 Đã lưu: {labeled_path}")
-                final_msg = f"✅ Hoàn tất — {processed} dòng đã gán nhãn → labeled_data.csv"
+                final_msg = f"✅ Hoàn tất — {processed}/{total} dòng đã gán nhãn ({newly_labeled} mới) → labeled_data.csv"
                 self.after(0, lambda: self.lbl_status_label.configure(text=final_msg, text_color="green"))
             except Exception as e:
                 err_msg = str(e)
@@ -1080,6 +1159,7 @@ class App(ctk.CTk):
                 self._lbl_is_running = False
                 self.after(0, lambda: self.lbl_start_btn.configure(state="normal", text="▶ Bắt Đầu Gán Nhãn"))
                 self.after(0, lambda: self.lbl_stop_btn.configure(state="disabled"))
+                self.after(0, lambda: self.lbl_reset_btn.configure(state="normal"))
                 self.after(0, lambda: self.lbl_endpoint_entry.configure(state="normal"))
                 self.after(0, lambda: self.lbl_model_entry.configure(state="normal"))
                 self.after(0, self.refresh_file_list)
@@ -1090,6 +1170,39 @@ class App(ctk.CTk):
             self._lbl_log("⏹ Đang gửi lệnh dừng...")
             self._lbl_stop_event.set()
             self.lbl_stop_btn.configure(state="disabled", text="Đang dừng...")
+
+    def _lbl_reset_labeled_data(self):
+        """Xóa labeled_data.csv và reset toàn bộ tiến trình gán nhãn."""
+        if self._lbl_is_running:
+            messagebox.showwarning("Lỗi", "Không thể reset khi đang gán nhãn! Hãy dừng trước.")
+            return
+        labeled_path = self._get_labeled_data_path()
+        if not os.path.exists(labeled_path):
+            messagebox.showinfo("Thông báo", "Chưa có file labeled_data.csv để xóa.")
+            return
+        confirm = messagebox.askyesno(
+            "Xác nhận Reset",
+            "Bạn có chắc chắn muốn xóa toàn bộ dữ liệu đã gán nhãn?\n\n"
+            "File labeled_data.csv sẽ bị xóa và bạn phải gán nhãn lại từ đầu.\n"
+            "Hành động này KHÔNG THỂ hoàn tác!",
+            icon="warning"
+        )
+        if not confirm:
+            return
+        try:
+            os.remove(labeled_path)
+            self.lbl_tree.delete(*self.lbl_tree.get_children())
+            self.lbl_progress.set(0)
+            self.lbl_progress_text.configure(text="0 / 0")
+            self.lbl_log_textbox.configure(state="normal")
+            self.lbl_log_textbox.delete("0.0", "end")
+            self.lbl_log_textbox.configure(state="disabled")
+            self._lbl_log("🔄 Đã reset — labeled_data.csv đã bị xóa.")
+            self._lbl_log("Sẵn sàng gán nhãn lại từ đầu.")
+            self.lbl_status_label.configure(text="🔄 Đã reset dữ liệu gán nhãn", text_color="orange")
+            self.refresh_file_list()
+        except Exception as e:
+            messagebox.showerror("Lỗi", f"Không thể xóa file: {e}")
 
     # ---------------------------------------------------------
     # TAB: LABEL MANAGER
