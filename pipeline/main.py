@@ -12,6 +12,13 @@ from crawler import extract_comments_stream, VOZCrawler, ThreadsCrawler, load_ke
 from nlp_pipeline.warehouse import append_to_warehouse, get_warehouse_count, read_warehouse, overwrite_warehouse
 from nlp_pipeline import VietnameseCommentPreprocessor
 from google_drive import upload_warehouse, download_warehouse
+from lmstudio_classifier import LMStudioClassifier
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
@@ -20,7 +27,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("FB Comment Management System by 17 Production")
+        self.title("Data manager")
         self.geometry("1100x800")
         self.minsize(950, 650)
 
@@ -28,7 +35,6 @@ class App(ctk.CTk):
         self.extracted_data = []
         self.is_running = False
         self.stop_event = threading.Event()
-        self.current_output_file = ""
 
         # Create Tabview
         self.tabview = ctk.CTkTabview(self)
@@ -37,12 +43,16 @@ class App(ctk.CTk):
         self.tab_crawler = self.tabview.add("Facebook Crawler")
         self.tab_keyword = self.tabview.add("Keyword Crawler")
         self.tab_warehouse = self.tabview.add("Warehouse Manager")
+        self.tab_labeling = self.tabview.add("Auto Labeling")
+        self.tab_label_mgr = self.tabview.add("Label Manager")
         self.tab_files = self.tabview.add("File Manager")
         self.tab_config = self.tabview.add("Config Manager")
 
         self._setup_crawler_tab()
         self._setup_keyword_crawler_tab()
         self._setup_warehouse_tab()
+        self._setup_labeling_tab()
+        self._setup_label_manager_tab()
         self._setup_file_manager_tab()
         self._setup_config_tab()
 
@@ -147,7 +157,7 @@ class App(ctk.CTk):
         input_frame.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(input_frame, text="Keyword:").grid(row=0, column=0, padx=10, pady=10)
-        self.kw_entry = ctk.CTkEntry(input_frame, placeholder_text="Nhập từ khóa cần cào...")
+        self.kw_entry = ctk.CTkEntry(input_frame, placeholder_text="Nhập từ khóa (nhiều keyword cách nhau bằng dấu ;)")
         self.kw_entry.grid(row=0, column=1, padx=(0, 10), pady=10, sticky="ew")
 
         ctk.CTkLabel(input_frame, text="Platform:").grid(row=0, column=2, padx=(10, 5), pady=10)
@@ -362,48 +372,65 @@ class App(ctk.CTk):
             self.refresh_file_list()
             self.refresh_keyword_history()
 
-    def _keyword_crawl_thread(self, keyword, platform, u_dec, u_fil, u_nor, u_seg,
+    def _keyword_crawl_thread(self, keywords, platform, u_dec, u_fil, u_nor, u_seg,
                                max_threads, max_pages, max_posts, max_scroll):
         crawler = None
         try:
-            # Init NLP preprocessor
+            # Init NLP preprocessor once for all keywords
             preprocessor = None
             if u_dec or u_fil or u_nor or u_seg:
                 self.after(0, self.kw_log_message, "Đang khởi tạo bộ tiền xử lý NLP...")
                 preprocessor = VietnameseCommentPreprocessor()
 
-            if platform == "VOZ":
-                crawler = VOZCrawler(
-                    keyword=keyword,
-                    max_threads=max_threads,
-                    max_pages=max_pages,
-                    log_callback=lambda msg: self.after(0, self.kw_log_message, msg),
-                    stop_event=self.kw_stop_event,
-                    data_callback=self.kw_handle_new_data,
-                    preprocessor=preprocessor,
-                    use_decoder=u_dec,
-                    use_filter=u_fil,
-                    use_normalizer=u_nor,
-                    use_segmentor=u_seg,
-                )
-            else:
-                crawler = ThreadsCrawler(
-                    keyword=keyword,
-                    max_posts=max_posts,
-                    max_scroll=max_scroll,
-                    log_callback=lambda msg: self.after(0, self.kw_log_message, msg),
-                    stop_event=self.kw_stop_event,
-                    data_callback=self.kw_handle_new_data,
-                    preprocessor=preprocessor,
-                    use_decoder=u_dec,
-                    use_filter=u_fil,
-                    use_normalizer=u_nor,
-                    use_segmentor=u_seg,
-                )
+            log_cb = lambda msg: self.after(0, self.kw_log_message, msg)
 
-            self.kw_active_crawler = crawler
-            crawler.crawl_keyword(keyword)
-            self.after(0, self.kw_log_message, f"--- HOÀN TẤT. Tổng {len(self.kw_extracted_data)} bình luận. ---")
+            for kw_idx, keyword in enumerate(keywords, start=1):
+                if self.kw_stop_event.is_set():
+                    self.after(0, self.kw_log_message, "Đã nhận lệnh DỪNG.")
+                    break
+
+                self.after(0, self.kw_log_message,
+                           f"\n{'='*50}\n[{kw_idx}/{len(keywords)}] Keyword: {keyword}\n{'='*50}")
+
+                # Close previous crawler before creating a new one
+                if crawler:
+                    try: crawler.close()
+                    except Exception: pass
+
+                if platform == "VOZ":
+                    crawler = VOZCrawler(
+                        keyword=keyword,
+                        max_threads=max_threads,
+                        max_pages=max_pages,
+                        log_callback=log_cb,
+                        stop_event=self.kw_stop_event,
+                        data_callback=self.kw_handle_new_data,
+                        preprocessor=preprocessor,
+                        use_decoder=u_dec,
+                        use_filter=u_fil,
+                        use_normalizer=u_nor,
+                        use_segmentor=u_seg,
+                    )
+                else:
+                    crawler = ThreadsCrawler(
+                        keyword=keyword,
+                        max_posts=max_posts,
+                        max_scroll=max_scroll,
+                        log_callback=log_cb,
+                        stop_event=self.kw_stop_event,
+                        data_callback=self.kw_handle_new_data,
+                        preprocessor=preprocessor,
+                        use_decoder=u_dec,
+                        use_filter=u_fil,
+                        use_normalizer=u_nor,
+                        use_segmentor=u_seg,
+                    )
+
+                self.kw_active_crawler = crawler
+                crawler.crawl_keyword(keyword)
+
+            self.after(0, self.kw_log_message,
+                       f"\n--- HOÀN TẤT TẤT CẢ {len(keywords)} KEYWORD. Tổng {len(self.kw_extracted_data)} bình luận. ---")
         except Exception as e:
             self.after(0, self.kw_log_message, f"Lỗi không xác định: {str(e)}")
         finally:
@@ -418,17 +445,23 @@ class App(ctk.CTk):
     def start_keyword_crawling(self):
         if self.kw_is_running:
             return
-        keyword = self.kw_entry.get().strip()
-        if not keyword:
+        raw_input = self.kw_entry.get().strip()
+        if not raw_input:
             messagebox.showwarning("Lỗi", "Vui lòng nhập keyword!")
+            return
+
+        # Parse multiple keywords separated by ;
+        keywords = [kw.strip() for kw in raw_input.split(";") if kw.strip()]
+        if not keywords:
+            messagebox.showwarning("Lỗi", "Vui lòng nhập ít nhất một keyword hợp lệ!")
             return
 
         platform = self.kw_platform_var.get()
 
-        # Check if keyword already in history – warn but allow
+        # Check which keywords already in history – warn but allow
         history = load_keyword_history()
         platform_key = platform.lower()
-        kw_already_crawled = keyword in history.get(platform_key, [])
+        already_crawled = [kw for kw in keywords if kw in history.get(platform_key, [])]
 
         u_dec = self.kw_dec_var.get()
         u_fil = self.kw_fil_var.get()
@@ -449,13 +482,13 @@ class App(ctk.CTk):
         self.kw_stop_event.clear()
         self._set_kw_gui_state(True)
 
-        if kw_already_crawled:
-            self.kw_log_message(f"⚠ Keyword '{keyword}' đã có trong lịch sử {platform}. Vẫn tiếp tục cào...")
-        self.kw_log_message(f"Bắt đầu cào {platform} với keyword: {keyword}")
+        if already_crawled:
+            self.kw_log_message(f"⚠ Các keyword đã có trong lịch sử {platform}: {', '.join(already_crawled)}. Vẫn tiếp tục cào...")
+        self.kw_log_message(f"Bắt đầu cào {platform} với {len(keywords)} keyword: {'; '.join(keywords)}")
 
         thread = threading.Thread(
             target=self._keyword_crawl_thread,
-            args=(keyword, platform, u_dec, u_fil, u_nor, u_seg,
+            args=(keywords, platform, u_dec, u_fil, u_nor, u_seg,
                   max_threads, max_pages, max_posts, max_scroll),
             daemon=True,
         )
@@ -805,6 +838,459 @@ class App(ctk.CTk):
         threading.Thread(target=_download, daemon=True).start()
 
     # ---------------------------------------------------------
+    # TAB: AUTO LABELING (LM Studio)
+    # ---------------------------------------------------------
+    def _get_labeled_data_path(self) -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "labeled_data.csv")
+
+    def _setup_labeling_tab(self):
+        tab = self.tab_labeling
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(2, weight=1)
+
+        conn_frame = ctk.CTkFrame(tab)
+        conn_frame.grid(row=0, column=0, padx=10, pady=5, sticky="ew")
+        conn_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(conn_frame, text="LM Studio Endpoint:").grid(row=0, column=0, padx=10, pady=8, sticky="w")
+        self.lbl_endpoint_var = ctk.StringVar(value="http://localhost:1234")
+        self.lbl_endpoint_entry = ctk.CTkEntry(conn_frame, textvariable=self.lbl_endpoint_var, width=350)
+        self.lbl_endpoint_entry.grid(row=0, column=1, padx=5, pady=8, sticky="w")
+
+        ctk.CTkLabel(conn_frame, text="Model:").grid(row=0, column=2, padx=(15, 5), pady=8, sticky="w")
+        self.lbl_model_var = ctk.StringVar(value="")
+        self.lbl_model_entry = ctk.CTkEntry(conn_frame, textvariable=self.lbl_model_var, width=250,
+                                             placeholder_text="(để trống = model đang load)")
+        self.lbl_model_entry.grid(row=0, column=3, padx=5, pady=8, sticky="w")
+
+        self.lbl_test_btn = ctk.CTkButton(conn_frame, text="🔌 Test Connection", width=140,
+                                           command=self._lbl_test_connection)
+        self.lbl_test_btn.grid(row=0, column=4, padx=10, pady=8)
+
+        ctrl_frame = ctk.CTkFrame(tab)
+        ctrl_frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
+
+        ctk.CTkLabel(ctrl_frame, text="Batch size:").pack(side="left", padx=(10, 5))
+        self.lbl_batch_var = ctk.StringVar(value="5")
+        ctk.CTkEntry(ctrl_frame, textvariable=self.lbl_batch_var, width=60).pack(side="left", padx=(0, 15))
+
+        self.lbl_start_btn = ctk.CTkButton(ctrl_frame, text="▶ Bắt Đầu Gán Nhãn", width=160,
+                                            fg_color="#2563EB", hover_color="#1D4ED8",
+                                            command=self._lbl_start_labeling)
+        self.lbl_start_btn.pack(side="left", padx=5)
+
+        self.lbl_stop_btn = ctk.CTkButton(ctrl_frame, text="⏹ Dừng", width=80,
+                                           fg_color="red", hover_color="darkred",
+                                           state="disabled", command=self._lbl_stop_labeling)
+        self.lbl_stop_btn.pack(side="left", padx=5)
+
+        self.lbl_progress_var = ctk.DoubleVar(value=0.0)
+        self.lbl_progress = ctk.CTkProgressBar(ctrl_frame, variable=self.lbl_progress_var, width=250)
+        self.lbl_progress.pack(side="left", padx=(15, 5))
+        self.lbl_progress.set(0)
+
+        self.lbl_progress_text = ctk.CTkLabel(ctrl_frame, text="0 / 0", text_color="gray")
+        self.lbl_progress_text.pack(side="left", padx=5)
+
+        work_frame = ctk.CTkFrame(tab)
+        work_frame.grid(row=2, column=0, padx=10, pady=5, sticky="nsew")
+        work_frame.grid_columnconfigure(1, weight=3)
+        work_frame.grid_columnconfigure(0, weight=1)
+        work_frame.grid_rowconfigure(0, weight=1)
+
+        self.lbl_log_textbox = ctk.CTkTextbox(work_frame, corner_radius=5)
+        self.lbl_log_textbox.grid(row=0, column=0, padx=(5, 5), pady=5, sticky="nsew")
+        self.lbl_log_textbox.insert("0.0", "Sẵn sàng. Hãy kiểm tra kết nối LM Studio trước khi bắt đầu.\n")
+        self.lbl_log_textbox.configure(state="disabled")
+
+        table_frame = ctk.CTkFrame(work_frame, fg_color="transparent")
+        table_frame.grid(row=0, column=1, padx=(5, 5), pady=5, sticky="nsew")
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+
+        self.lbl_tree = ttk.Treeview(table_frame, columns=("id", "text", "label"), show="headings")
+        self.lbl_tree.heading("id", text="ID")
+        self.lbl_tree.heading("text", text="Nội dung bình luận")
+        self.lbl_tree.heading("label", text="Nhãn")
+        self.lbl_tree.column("id", width=50, anchor="center")
+        self.lbl_tree.column("text", width=500, anchor="w")
+        self.lbl_tree.column("label", width=100, anchor="center")
+
+        lbl_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.lbl_tree.yview)
+        self.lbl_tree.configure(yscrollcommand=lbl_scroll.set)
+        self.lbl_tree.grid(row=0, column=0, sticky="nsew")
+        lbl_scroll.grid(row=0, column=1, sticky="ns")
+
+        self.lbl_status_label = ctk.CTkLabel(tab, text="Trạng thái: Đang chờ lệnh", text_color="gray")
+        self.lbl_status_label.grid(row=3, column=0, pady=5, sticky="w", padx=10)
+
+        self._lbl_is_running = False
+        self._lbl_stop_event = threading.Event()
+
+    def _lbl_log(self, msg):
+        self.lbl_log_textbox.configure(state="normal")
+        self.lbl_log_textbox.insert("end", f"{msg}\n")
+        self.lbl_log_textbox.see("end")
+        self.lbl_log_textbox.configure(state="disabled")
+
+    def _lbl_test_connection(self):
+        base_url = self.lbl_endpoint_var.get().strip()
+        if not base_url:
+            messagebox.showwarning("Lỗi", "Vui lòng nhập endpoint!")
+            return
+        self._lbl_log(f"🔌 Đang kiểm tra kết nối tới {base_url} ...")
+        self.lbl_test_btn.configure(state="disabled", text="Đang kiểm tra...")
+
+        def _test():
+            result = LMStudioClassifier.test_connection(base_url)
+            if result["ok"]:
+                models_str = ", ".join(result["models"]) if result["models"] else "(không có model nào)"
+                self.after(0, self._lbl_log, f"✅ Kết nối thành công! Models: {models_str}")
+                self.after(0, lambda: self.lbl_status_label.configure(
+                    text=f"✅ LM Studio đang chạy — {len(result['models'])} model(s)", text_color="green"))
+                if len(result["models"]) == 1:
+                    self.after(0, lambda: self.lbl_model_var.set(result["models"][0]))
+            else:
+                self.after(0, self._lbl_log, f"❌ Lỗi: {result['error']}")
+                self.after(0, lambda: self.lbl_status_label.configure(
+                    text="❌ Không thể kết nối LM Studio", text_color="red"))
+            self.after(0, lambda: self.lbl_test_btn.configure(state="normal", text="🔌 Test Connection"))
+        threading.Thread(target=_test, daemon=True).start()
+
+    def _lbl_start_labeling(self):
+        if self._lbl_is_running:
+            return
+        base_url = self.lbl_endpoint_var.get().strip()
+        if not base_url:
+            messagebox.showwarning("Lỗi", "Vui lòng nhập endpoint!")
+            return
+        rows = read_warehouse()
+        if not rows:
+            messagebox.showwarning("Lỗi", "Warehouse trống! Hãy crawl dữ liệu trước.")
+            return
+        try:
+            batch_size = max(1, min(int(self.lbl_batch_var.get()), 20))
+        except ValueError:
+            batch_size = 5
+        model_name = self.lbl_model_var.get().strip()
+
+        self.lbl_tree.delete(*self.lbl_tree.get_children())
+        self.lbl_log_textbox.configure(state="normal")
+        self.lbl_log_textbox.delete("0.0", "end")
+        self.lbl_log_textbox.configure(state="disabled")
+        self.lbl_progress.set(0)
+        self.lbl_progress_text.configure(text=f"0 / {len(rows)}")
+
+        self._lbl_stop_event.clear()
+        self._lbl_is_running = True
+        self.lbl_start_btn.configure(state="disabled", text="Đang chạy...")
+        self.lbl_stop_btn.configure(state="normal")
+        self.lbl_endpoint_entry.configure(state="disabled")
+        self.lbl_model_entry.configure(state="disabled")
+
+        endpoint = f"{base_url.rstrip('/')}/v1/chat/completions"
+        self._lbl_log(f"🚀 Bắt đầu gán nhãn {len(rows)} bình luận")
+        self._lbl_log(f"   Endpoint: {endpoint}")
+        self._lbl_log(f"   Model: {model_name or '(auto)'}")
+        self._lbl_log(f"   Batch size: {batch_size}")
+        self._lbl_log("=" * 50)
+
+        def _labeling_thread():
+            import pandas as pd
+            classifier = LMStudioClassifier(endpoint=endpoint, model=model_name, timeout=120)
+            labeled_path = self._get_labeled_data_path()
+            if os.path.exists(labeled_path):
+                try:
+                    os.remove(labeled_path)
+                except Exception:
+                    pass
+            file_exists = False
+            total = len(rows)
+            processed = 0
+            label_counts = {}
+            buffer_rows = []
+            buffer_tasks = []
+
+            def _flush_batch():
+                nonlocal processed, file_exists
+                predictions = classifier.predict(buffer_tasks)
+                csv_rows = []
+                for row_i, pred in zip(buffer_rows, predictions):
+                    label = pred["result"][0]["value"]["choices"][0]
+                    label_counts[label] = label_counts.get(label, 0) + 1
+                    processed += 1
+                    csv_rows.append({"id": row_i.get("id", processed), "text": row_i.get("text", ""), "label": label})
+                    rid = row_i.get("id", processed)
+                    dt = str(row_i.get("text", "")).replace("\n", "  ")[:100]
+                    lb = label
+                    self.after(0, lambda r=rid, d=dt, l=lb: self.lbl_tree.insert("", "end", values=(r, d, l)))
+                pd.DataFrame(csv_rows).to_csv(labeled_path, mode="a", header=not file_exists, index=False, encoding="utf-8-sig")
+                file_exists = True
+                p = processed / total
+                pc = processed
+                self.after(0, lambda v=p: self.lbl_progress.set(v))
+                self.after(0, lambda v=pc, t=total: self.lbl_progress_text.configure(text=f"{v} / {t}"))
+                stats_str = " | ".join(f"{k}: {v}" for k, v in label_counts.items())
+                self.after(0, self._lbl_log, f"   ✓ Batch xong. [{stats_str}]")
+
+            try:
+                for row in rows:
+                    if self._lbl_stop_event.is_set():
+                        self.after(0, self._lbl_log, "🛑 Đã nhận lệnh DỪNG. Dữ liệu đã gán được lưu.")
+                        break
+                    buffer_rows.append(row)
+                    buffer_tasks.append({"data": {"text": str(row.get("text", ""))}})
+                    if len(buffer_tasks) < batch_size:
+                        continue
+                    self.after(0, self._lbl_log, f"📤 Gửi batch {processed + 1}–{processed + len(buffer_tasks)} / {total} ...")
+                    _flush_batch()
+                    buffer_rows.clear()
+                    buffer_tasks.clear()
+                if buffer_tasks and not self._lbl_stop_event.is_set():
+                    self.after(0, self._lbl_log, f"📤 Gửi batch cuối {processed + 1}–{processed + len(buffer_tasks)} / {total} ...")
+                    _flush_batch()
+                self.after(0, self._lbl_log, "\n" + "=" * 50)
+                self.after(0, self._lbl_log, f"✅ HOÀN TẤT: {processed}/{total} bình luận đã gán nhãn")
+                for lbl, cnt in label_counts.items():
+                    self.after(0, self._lbl_log, f"   {lbl}: {cnt}")
+                self.after(0, self._lbl_log, f"📂 Đã lưu: {labeled_path}")
+                final_msg = f"✅ Hoàn tất — {processed} dòng đã gán nhãn → labeled_data.csv"
+                self.after(0, lambda: self.lbl_status_label.configure(text=final_msg, text_color="green"))
+            except Exception as e:
+                err_msg = str(e)
+                self.after(0, self._lbl_log, f"❌ Lỗi: {err_msg}")
+                self.after(0, lambda: self.lbl_status_label.configure(text=f"❌ Lỗi: {err_msg[:80]}", text_color="red"))
+            finally:
+                self._lbl_is_running = False
+                self.after(0, lambda: self.lbl_start_btn.configure(state="normal", text="▶ Bắt Đầu Gán Nhãn"))
+                self.after(0, lambda: self.lbl_stop_btn.configure(state="disabled"))
+                self.after(0, lambda: self.lbl_endpoint_entry.configure(state="normal"))
+                self.after(0, lambda: self.lbl_model_entry.configure(state="normal"))
+                self.after(0, self.refresh_file_list)
+        threading.Thread(target=_labeling_thread, daemon=True).start()
+
+    def _lbl_stop_labeling(self):
+        if self._lbl_is_running:
+            self._lbl_log("⏹ Đang gửi lệnh dừng...")
+            self._lbl_stop_event.set()
+            self.lbl_stop_btn.configure(state="disabled", text="Đang dừng...")
+
+    # ---------------------------------------------------------
+    # TAB: LABEL MANAGER
+    # ---------------------------------------------------------
+    def _setup_label_manager_tab(self):
+        tab = self.tab_label_mgr
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(tab)
+        header.grid(row=0, column=0, padx=10, pady=5, sticky="ew")
+
+        row1 = ctk.CTkFrame(header, fg_color="transparent")
+        row1.pack(fill="x", padx=5, pady=(5, 2))
+        ctk.CTkButton(row1, text="⟳ Tải dữ liệu", width=110, command=self._lm_load_data).pack(side="left", padx=5)
+        ctk.CTkLabel(row1, text="Tìm kiếm:").pack(side="left", padx=(15, 5))
+        self.lm_search_var = ctk.StringVar()
+        ctk.CTkEntry(row1, textvariable=self.lm_search_var, placeholder_text="Nhập text để lọc...", width=200).pack(side="left", padx=5)
+        ctk.CTkButton(row1, text="Lọc", width=60, command=self._lm_filter_data).pack(side="left", padx=5)
+        ctk.CTkLabel(row1, text="Nhãn:").pack(side="left", padx=(10, 5))
+        self.lm_label_filter_var = ctk.StringVar(value="Tất cả")
+        self.lm_label_filter = ctk.CTkOptionMenu(row1, values=["Tất cả", "Clean", "Spam", "Hate Speech", "Harassment", "Obscene"],
+                                                   variable=self.lm_label_filter_var, command=lambda _: self._lm_filter_data(), width=120)
+        self.lm_label_filter.pack(side="left", padx=5)
+        ctk.CTkButton(row1, text="Xóa lọc", width=70, command=self._lm_clear_filter).pack(side="left", padx=5)
+        self.lm_stats_label = ctk.CTkLabel(row1, text="Labeled: 0 dòng", text_color="gray")
+        self.lm_stats_label.pack(side="right", padx=10)
+
+        row2 = ctk.CTkFrame(header, fg_color="transparent")
+        row2.pack(fill="x", padx=5, pady=(2, 5))
+        ctk.CTkButton(row2, text="Xuất CSV", width=90, fg_color="#059669", hover_color="#047857", command=self._lm_export_csv).pack(side="left", padx=5)
+        ctk.CTkLabel(row2, text="Sửa nhãn →").pack(side="left", padx=(20, 5))
+        self.lm_edit_label_var = ctk.StringVar(value="Clean")
+        ctk.CTkOptionMenu(row2, values=["Clean", "Spam", "Hate Speech", "Harassment", "Obscene"],
+                           variable=self.lm_edit_label_var, width=120).pack(side="left", padx=2)
+        ctk.CTkButton(row2, text="Áp dụng", width=80, fg_color="#7C3AED", hover_color="#6D28D9", command=self._lm_edit_label).pack(side="left", padx=5)
+        ctk.CTkButton(row2, text="Xóa dòng chọn", width=110, fg_color="red", hover_color="darkred", command=self._lm_delete_selected).pack(side="right", padx=5)
+
+        main_frame = ctk.CTkFrame(tab)
+        main_frame.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
+        main_frame.grid_columnconfigure(0, weight=3)
+        main_frame.grid_columnconfigure(1, weight=2)
+        main_frame.grid_rowconfigure(0, weight=1)
+
+        tf = ctk.CTkFrame(main_frame)
+        tf.grid(row=0, column=0, padx=(5, 3), pady=5, sticky="nsew")
+        tf.grid_columnconfigure(0, weight=1)
+        tf.grid_rowconfigure(0, weight=1)
+        self.lm_tree = ttk.Treeview(tf, columns=("id", "text", "label"), show="headings", selectmode="extended")
+        self.lm_tree.heading("id", text="ID")
+        self.lm_tree.heading("text", text="Nội dung bình luận")
+        self.lm_tree.heading("label", text="Nhãn")
+        self.lm_tree.column("id", width=50, anchor="center")
+        self.lm_tree.column("text", width=400, anchor="w")
+        self.lm_tree.column("label", width=100, anchor="center")
+        lm_scroll = ttk.Scrollbar(tf, orient="vertical", command=self.lm_tree.yview)
+        self.lm_tree.configure(yscrollcommand=lm_scroll.set)
+        self.lm_tree.grid(row=0, column=0, sticky="nsew")
+        lm_scroll.grid(row=0, column=1, sticky="ns")
+
+        chart_frame = ctk.CTkFrame(main_frame)
+        chart_frame.grid(row=0, column=1, padx=(3, 5), pady=5, sticky="nsew")
+        chart_frame.grid_columnconfigure(0, weight=1)
+        chart_frame.grid_rowconfigure(0, weight=1)
+        self.lm_chart_frame = chart_frame
+        self._lm_canvas = None
+
+        self.lm_status_label = ctk.CTkLabel(tab, text="Trạng thái: Sẵn sàng", text_color="gray")
+        self.lm_status_label.grid(row=2, column=0, pady=5, sticky="w", padx=10)
+        self._lm_all_rows = []
+        self._lm_load_data()
+
+    def _lm_load_data(self):
+        labeled_path = self._get_labeled_data_path()
+        self._lm_all_rows = []
+        if os.path.isfile(labeled_path):
+            try:
+                with open(labeled_path, "r", encoding="utf-8-sig") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        self._lm_all_rows.append({"id": row.get("id", ""), "text": row.get("text", ""), "label": row.get("label", "Clean")})
+            except Exception as e:
+                messagebox.showerror("Lỗi", f"Không thể đọc labeled_data.csv: {e}")
+        self._lm_display_rows(self._lm_all_rows)
+        self._lm_update_chart()
+        self.lm_stats_label.configure(text=f"Labeled: {len(self._lm_all_rows)} dòng")
+        if self._lm_all_rows:
+            self.lm_status_label.configure(text=f"Đã tải {len(self._lm_all_rows)} dòng từ labeled_data.csv", text_color="green")
+        else:
+            self.lm_status_label.configure(text="Chưa có dữ liệu labeled_data.csv", text_color="gray")
+
+    def _lm_display_rows(self, rows):
+        self.lm_tree.delete(*self.lm_tree.get_children())
+        for row in rows:
+            self.lm_tree.insert("", "end", values=(row.get("id", ""), str(row.get("text", "")).replace("\n", "  "), row.get("label", "")))
+
+    def _lm_filter_data(self):
+        query = self.lm_search_var.get().strip().lower()
+        label_filter = self.lm_label_filter_var.get()
+        filtered = self._lm_all_rows
+        if query:
+            filtered = [r for r in filtered if query in r.get("text", "").lower()]
+        if label_filter != "Tất cả":
+            filtered = [r for r in filtered if r.get("label", "") == label_filter]
+        self._lm_display_rows(filtered)
+        self.lm_status_label.configure(text=f"Hiển thị {len(filtered)}/{len(self._lm_all_rows)} dòng", text_color="blue")
+
+    def _lm_clear_filter(self):
+        self.lm_search_var.set("")
+        self.lm_label_filter_var.set("Tất cả")
+        self._lm_display_rows(self._lm_all_rows)
+        self.lm_status_label.configure(text=f"Hiển thị tất cả {len(self._lm_all_rows)} dòng", text_color="green")
+
+    def _lm_save_data(self):
+        labeled_path = self._get_labeled_data_path()
+        try:
+            with open(labeled_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=["id", "text", "label"])
+                writer.writeheader()
+                writer.writerows(self._lm_all_rows)
+        except Exception as e:
+            messagebox.showerror("Lỗi", f"Không thể lưu file: {e}")
+
+    def _lm_delete_selected(self):
+        selected = self.lm_tree.selection()
+        if not selected:
+            messagebox.showwarning("Nhắc nhở", "Hãy chọn ít nhất 1 dòng để xóa.")
+            return
+        ids_to_delete = set()
+        for item in selected:
+            vals = self.lm_tree.item(item)["values"]
+            if vals:
+                ids_to_delete.add(str(vals[0]))
+        if not messagebox.askyesno("Xác nhận", f"Xóa {len(ids_to_delete)} dòng?"):
+            return
+        self._lm_all_rows = [r for r in self._lm_all_rows if str(r["id"]) not in ids_to_delete]
+        self._lm_save_data()
+        self._lm_display_rows(self._lm_all_rows)
+        self._lm_update_chart()
+        self.lm_stats_label.configure(text=f"Labeled: {len(self._lm_all_rows)} dòng")
+        self.lm_status_label.configure(text=f"Đã xóa {len(ids_to_delete)} dòng.", text_color="orange")
+
+    def _lm_edit_label(self):
+        selected = self.lm_tree.selection()
+        if not selected:
+            messagebox.showwarning("Nhắc nhở", "Hãy chọn ít nhất 1 dòng để sửa nhãn.")
+            return
+        new_label = self.lm_edit_label_var.get()
+        ids_to_edit = set()
+        for item in selected:
+            vals = self.lm_tree.item(item)["values"]
+            if vals:
+                ids_to_edit.add(str(vals[0]))
+        changed = 0
+        for row in self._lm_all_rows:
+            if str(row["id"]) in ids_to_edit:
+                row["label"] = new_label
+                changed += 1
+        self._lm_save_data()
+        self._lm_display_rows(self._lm_all_rows)
+        self._lm_update_chart()
+        self.lm_status_label.configure(text=f"Đã sửa {changed} dòng → '{new_label}'", text_color="green")
+
+    def _lm_export_csv(self):
+        if not self._lm_all_rows:
+            messagebox.showwarning("Nhắc nhở", "Không có dữ liệu để xuất.")
+            return
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        export_path = os.path.join(os.getcwd(), f"labeled_export_{timestamp}.csv")
+        try:
+            with open(export_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=["id", "text", "label"])
+                writer.writeheader()
+                writer.writerows(self._lm_all_rows)
+            messagebox.showinfo("Thành công", f"Đã xuất {len(self._lm_all_rows)} dòng ra:\n{os.path.basename(export_path)}")
+            self.refresh_file_list()
+        except Exception as e:
+            messagebox.showerror("Lỗi", f"Không thể xuất CSV: {e}")
+
+    def _lm_update_chart(self):
+        label_colors = {"Clean": "#22C55E", "Spam": "#F59E0B", "Hate Speech": "#EF4444", "Harassment": "#8B5CF6", "Obscene": "#EC4899"}
+        counts = {lbl: 0 for lbl in label_colors}
+        for row in self._lm_all_rows:
+            lbl = row.get("label", "Clean")
+            counts[lbl] = counts.get(lbl, 0) + 1
+        total = sum(counts.values())
+        if self._lm_canvas:
+            self._lm_canvas.get_tk_widget().destroy()
+            self._lm_canvas = None
+        fig = Figure(figsize=(4, 4), dpi=100, facecolor="#2B2B2B")
+        ax = fig.add_subplot(111)
+        ax.set_facecolor("#2B2B2B")
+        labels = list(counts.keys())
+        values = list(counts.values())
+        colors = [label_colors.get(lbl, "#6B7280") for lbl in labels]
+        bars = ax.barh(labels, values, color=colors, edgecolor="#444", height=0.6)
+        max_val = max(values) if values and max(values) > 0 else 1
+        for bar, val in zip(bars, values):
+            pct = f"{val / total * 100:.1f}%" if total > 0 else "0%"
+            ax.text(bar.get_width() + max_val * 0.02, bar.get_y() + bar.get_height() / 2,
+                    f"{val}  ({pct})", va="center", ha="left", fontsize=9, color="white", fontweight="bold")
+        ax.set_title(f"Phân Bố Nhãn (n={total})", fontsize=12, color="white", fontweight="bold", pad=10)
+        ax.tick_params(colors="white", labelsize=9)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["bottom"].set_color("#555")
+        ax.spines["left"].set_color("#555")
+        ax.xaxis.label.set_color("white")
+        if max_val > 0:
+            ax.set_xlim(0, max_val * 1.35)
+        fig.tight_layout()
+        self._lm_canvas = FigureCanvasTkAgg(fig, master=self.lm_chart_frame)
+        self._lm_canvas.draw()
+        self._lm_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        plt.close(fig)
+
+    # ---------------------------------------------------------
     # TAB 4: FILE MANAGER
     # ---------------------------------------------------------
     def _setup_file_manager_tab(self):
@@ -815,7 +1301,7 @@ class App(ctk.CTk):
         # Header
         header = ctk.CTkFrame(tab, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
-        
+
         ctk.CTkButton(header, text="Làm mới danh sách", command=self.refresh_file_list).pack(side="left", padx=5)
         ctk.CTkButton(header, text="Mở thư mục hiện tại", command=self.open_current_folder).pack(side="left", padx=5)
         ctk.CTkButton(header, text="Xóa File Chọn", command=self.delete_selected_file, fg_color="red").pack(side="right", padx=5)
@@ -1119,16 +1605,6 @@ class App(ctk.CTk):
 
     def handle_new_data(self, batch):
         self.after(0, self._append_to_table, batch)
-        if self.current_output_file:
-            try:
-                file_exists = os.path.exists(self.current_output_file)
-                with open(self.current_output_file, 'a', newline='', encoding='utf-8') as f:
-                    writer = csv.DictWriter(f, fieldnames=['id', 'text'])
-                    if not file_exists:
-                        writer.writeheader()
-                    writer.writerows(batch)
-            except Exception as e:
-                self.after(0, self.log_message, f"Lỗi ghi CSV: {e}")
         # Also append to warehouse.csv
         try:
             append_to_warehouse(batch)
@@ -1170,8 +1646,8 @@ class App(ctk.CTk):
     def _crawl_thread(self, url, headless, u_dec, u_fil, u_nor, u_seg):
         try:
             extract_comments_stream(
-                url_input=url, 
-                headless=headless, 
+                url_input=url,
+                headless=headless,
                 use_decoder=u_dec,
                 use_filter=u_fil,
                 use_normalizer=u_nor,
@@ -1180,7 +1656,7 @@ class App(ctk.CTk):
                 data_callback=self.handle_new_data,
                 stop_event=self.stop_event
             )
-            self.after(0, self.log_message, f"--- HOÀN TẤT. Đã lưu tổng {len(self.extracted_data)} mục. ---")
+            self.after(0, self.log_message, f"--- HOÀN TẤT. Đã lưu tổng {len(self.extracted_data)} mục vào warehouse. ---")
         except Exception as e:
             self.after(0, self.log_message, f"Lỗi không xác định: {str(e)}")
         finally:
@@ -1188,7 +1664,7 @@ class App(ctk.CTk):
 
     def start_crawling(self):
         if self.is_running: return
-            
+
         url_input = self.url_entry.get().strip()
         if not url_input:
             messagebox.showwarning("Lỗi", "Vui lòng nhập ít nhất một URL!")
@@ -1199,22 +1675,19 @@ class App(ctk.CTk):
         u_fil = self.use_filter_var.get()
         u_nor = self.use_normalizer_var.get()
         u_seg = self.use_segmentor_var.get()
-        
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.current_output_file = os.path.join(os.getcwd(), f"comments_{timestamp}.csv")
-        
+
         self.extracted_data = []
         self.tree_data.delete(*self.tree_data.get_children())
         self.log_textbox.configure(state="normal")
         self.log_textbox.delete("0.0", "end")
         self.log_textbox.configure(state="disabled")
-        
+
         self.stop_event.clear()
         self.set_gui_state(True)
-        self.log_message(f"Tạo file lưu trữ: {self.current_output_file}")
-        
-        thread = threading.Thread(target=self._crawl_thread, 
-                                  args=(url_input, headless, u_dec, u_fil, u_nor, u_seg), 
+        self.log_message("Dữ liệu sẽ được lưu trực tiếp vào warehouse.csv")
+
+        thread = threading.Thread(target=self._crawl_thread,
+                                  args=(url_input, headless, u_dec, u_fil, u_nor, u_seg),
                                   daemon=True)
         thread.start()
 

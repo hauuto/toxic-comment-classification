@@ -23,6 +23,20 @@ _ASCII_LETTERS = re.compile(r"[a-zA-Z]+")
 # Vietnamese-specific diacritical characters (quick check set from config)
 _PLACEHOLDER_RE = re.compile(r"<(?:url|mention|hashtag|email|date|NUM|IP)>|:[a-z_]+:")
 
+# Threads-specific UI noise patterns (pure username lines, login prompts)
+_THREADS_USERNAME_ONLY = re.compile(r"^[a-z0-9_.]{3,30}$")
+_THREADS_UI_NOISE = re.compile(
+    r"^(?:"
+    r"hãy đăng nhập.*|"
+    r"đăng nhập hoặc đăng ký.*|"
+    r"tiếp tục (?:bằng|với) instagram|"
+    r"continue with instagram|"
+    r"chính sách quyền riêng tư.*|"
+    r"privacy policy.*|"
+    r"(?:đang trả lời|replying to)\s*<?.*)$",
+    re.IGNORECASE,
+)
+
 
 class Filter:
     """Filter out noisy or uninformative comments."""
@@ -145,6 +159,16 @@ class Filter:
         """Check if comment is VOZ admin/mod action or system metadata."""
         return bool(self._admin_junk_pattern.search(text))
 
+    def is_threads_ui_noise(self, text: str) -> bool:
+        """Check if comment is Threads platform UI noise (login prompts, usernames, etc.)."""
+        stripped = text.strip()
+        if _THREADS_UI_NOISE.match(stripped):
+            return True
+        # Pure username lines: only lowercase alphanumeric + _ + ., no spaces
+        if _THREADS_USERNAME_ONLY.fullmatch(stripped):
+            return True
+        return False
+
     # ------------------------------------------------------------------
     # Main filter entry point
     # ------------------------------------------------------------------
@@ -166,6 +190,10 @@ class Filter:
         # Admin junk check (VOZ mod actions, ban notices, sent-from footers)
         if self.is_admin_junk(text):
             return False, "admin_junk"
+
+        # Threads UI noise check (login prompts, username-only lines)
+        if self.is_threads_ui_noise(text):
+            return False, "threads_ui_noise"
 
         # Raw length check (before normalize) — uses text if raw_text not given
         check_raw = raw_text if raw_text is not None else text

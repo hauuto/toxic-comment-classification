@@ -35,6 +35,71 @@ load_dotenv()
 
 
 # =========================================================================== #
+#  Threads-specific text cleaning helpers
+# =========================================================================== #
+
+# Patterns for Threads UI / system noise that should never be scraped
+_THREADS_UI_SKIP_PATTERNS = re.compile(
+    r"^("
+    # Login / signup prompts
+    r"hãy đăng nhập.*thread.*|"
+    r"đăng nhập hoặc đăng ký.*|"
+    r"log in to see more.*|"
+    r"tiếp tục bằng instagram|"
+    r"continue with instagram|"
+    r"tiếp tục với instagram|"
+    r"dùng ứng dụng|use app|"
+    # Policy / legal footer
+    r"chính sách quyền riêng tư.*|"
+    r"privacy policy.*|"
+    r"điều khoản.*|terms.*|"
+    # Reply-to prefixes that got scraped as standalone text
+    r"đang trả lời\s*<?.*|"
+    r"replying to\s*<?.*|"
+    # Pure username lines (no spaces, only alphanumeric + _ + .)
+    r"[a-z0-9_.]{3,30}"
+    r")$",
+    re.IGNORECASE,
+)
+
+# Trailing "Translate" / "Dịch" button text stuck to comment
+_THREADS_TRAILING_TRANSLATE = re.compile(r"(?:[Tt]ranslate|Dịch)\s*$")
+
+# "gia đình" repeated anomaly from emoji <img alt="gia đình"> leak
+_THREADS_GIA_DINH_SPAM = re.compile(r"(?:\s*gia đình\s*){2,}:?")
+# Single stray "gia đình" token right before/after emoji token or at boundaries
+# Also consume trailing colon that may be part of broken emoji syntax "gia đình:"
+_THREADS_GIA_DINH_NEAR_EMOJI = re.compile(r"\s*gia đình\s*:?\s*(?=:|$)")
+
+
+def _clean_threads_text(text: str) -> str | None:
+    """Clean a raw Threads comment text. Returns None if text should be skipped."""
+    if not text or not text.strip():
+        return None
+
+    text = text.strip()
+
+    # Skip UI / system noise
+    if _THREADS_UI_SKIP_PATTERNS.fullmatch(text):
+        return None
+
+    # Remove trailing "Translate" / "Dịch" button text
+    text = _THREADS_TRAILING_TRANSLATE.sub("", text).strip()
+
+    # Fix "gia đình" spam from emoji alt text leak
+    text = _THREADS_GIA_DINH_SPAM.sub(" ", text)
+    text = _THREADS_GIA_DINH_NEAR_EMOJI.sub(" ", text)
+
+    # Collapse whitespace
+    text = re.sub(r"\s{2,}", " ", text).strip()
+
+    if not text:
+        return None
+
+    return text
+
+
+# =========================================================================== #
 #  Keyword History – persisted in keyword_history.json
 # =========================================================================== #
 
@@ -488,38 +553,85 @@ def _extract_threads(page, log, current_id, seen_texts, stop_event, preprocessor
     log("Bắt đầu quét dữ liệu Threads...")
     max_empty_scrolls = 5
     empty_scrolls = 0
-    
+
+    # JS to clean DOM before text extraction:
+    # 1. Remove "Translate"/"Dịch" button elements so they don't leak into text_content()
+    # 2. Replace emoji <img alt="..."> with proper :token: placeholders (not raw alt text)
+    #    This prevents "gia đình" alt text from leaking as repeated garbage
+    _threads_dom_cleanup_js = r"""
+        // Remove Translate / Dịch buttons (they sit as <span role="link"> near comments)
+        document.querySelectorAll('span[role="link"], div[role="button"]').forEach(el => {
+            const t = (el.textContent || '').trim().toLowerCase();
+            if (t === 'translate' || t === 'dịch' || t === 'see translation' || t === 'xem bản dịch') {
+                el.remove();
+            }
+        });
+
+        // Replace emoji <img> with empty string (decoder will handle Unicode emoji later)
+        // The alt text of Threads emoji images is often misleading ("gia đình", etc.)
+        document.querySelectorAll('div[dir="auto"] img, span[dir="auto"] img').forEach(img => {
+            if (img.alt && img.width && img.width <= 20) {
+                // Small image = emoji icon. Remove entirely; unicode emoji in text is enough.
+                img.remove();
+            }
+        });
+    """
+
     while True:
         if stop_event and stop_event.is_set():
             return current_id
             
         time.sleep(2)
-        
-        # Threads DOM is obfuscated. Use generic span with dir auto
-        comment_blocks = page.locator('span[dir="auto"], div[dir="auto"]')
+
+        # --- Click "See more" / "Xem thêm" to expand truncated comments ---
+        see_more_selectors = [
+            'div[role="button"]:has-text("See more")',
+            'div[role="button"]:has-text("Xem thêm")',
+            'span[role="link"]:has-text("See more")',
+            'span[role="link"]:has-text("Xem thêm")',
+        ]
+        for sel in see_more_selectors:
+            try:
+                buttons = page.locator(sel)
+                for bi in range(buttons.count()):
+                    try:
+                        if buttons.nth(bi).is_visible():
+                            buttons.nth(bi).click(timeout=1000)
+                            time.sleep(0.5)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Clean DOM before extraction
+        try:
+            page.evaluate(_threads_dom_cleanup_js)
+        except Exception:
+            pass
+
+        # Threads DOM is obfuscated. Use generic span/div with dir="auto"
+        comment_blocks = page.locator('div[data-pressable-container="true"]')
         count = comment_blocks.count()
+        # Fallback to generic selector if no pressable containers found
+        if count == 0:
+            comment_blocks = page.locator('span[dir="auto"], div[dir="auto"]')
+            count = comment_blocks.count()
         new_batch = []
-        
-        # Threads emojis are usually just unicode, no img replace needed mostly, but we'll try just in case 
-        replace_emoji_js = r"""
-            const images = document.querySelectorAll('div[dir="auto"].xzsf02u img');
-            images.forEach(img => {
-                if (img.alt) {
-                    const textNode = document.createTextNode(img.alt);
-                    img.parentNode.replaceChild(textNode, img);
-                }
-            });
-        """
-        page.evaluate(replace_emoji_js)
         
         for i in range(count):
             try:
                 full_text = comment_blocks.nth(i).text_content().strip()
-                if not full_text: continue
-                # Skip the exact text of the login wall button block
-                if full_text in ['Tiếp tục với Instagram', 'Continue with Instagram', 'Dùng ứng dụng', 'Use app']: continue
-                if len(full_text) < 2 and full_text not in ['Ok', 'Dạ']: continue
-                
+                if not full_text:
+                    continue
+
+                # Apply Threads-specific text cleaning
+                full_text = _clean_threads_text(full_text)
+                if not full_text:
+                    continue
+
+                if len(full_text) < 2 and full_text not in ['Ok', 'Dạ']:
+                    continue
+
                 if preprocessor:
                     processed = preprocessor.process_comment(full_text, use_decoder=use_decoder, use_filter=use_filter, use_normalizer=use_normalizer, use_segmentor=use_segmentor)
                     if not processed["is_valid"]: continue
@@ -806,12 +918,11 @@ class VOZCrawler:
 
         return current_thread_comments
 
-    def crawl_keyword(self, keyword=None, persist: bool = True) -> List[str]:
+    def crawl_keyword(self, keyword=None) -> List[str]:
         keyword = keyword or self.keyword
         if not keyword: raise ValueError("keyword is required")
         if self.driver is None: self.get_driver()
 
-        output_path = self.get_output_path(keyword)
         urls = self.search_voz(keyword, self.max_threads)
         if not urls:
             self._log("[VOZ] Không tìm thấy link nào.")
@@ -849,9 +960,6 @@ class VOZCrawler:
 
                 if processed_batch:
                     all_texts.extend(processed_batch)
-                    if persist:
-                        count = _append_batch_to_csv(output_path, processed_batch)
-                        self._log(f"    [CSV] +{count} dòng -> {os.path.basename(output_path)}")
                     wh_rows = [{"text": t} for t in processed_batch]
                     wh_count = append_to_warehouse(wh_rows)
                     self._log(f"    [WAREHOUSE] +{wh_count} dòng")
@@ -998,6 +1106,7 @@ class ThreadsCrawler:
             if self._stopped(): break
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(random.uniform(1.5, 2.5))
+            # Click "View more replies" / "Xem thêm" reply expansion buttons
             try:
                 btns = self.driver.find_elements(
                     By.XPATH,
@@ -1010,6 +1119,19 @@ class ThreadsCrawler:
                     try:
                         self.driver.execute_script("arguments[0].click();", btn)
                         time.sleep(random.uniform(1.0, 2.0))
+                    except Exception: pass
+            except Exception: pass
+            # Click "See more" / "Xem thêm" to expand truncated comment text
+            try:
+                see_more_btns = self.driver.find_elements(
+                    By.XPATH,
+                    "//div[@role='button' and (text()='See more' or text()='Xem thêm')] | "
+                    "//span[@role='link' and (text()='See more' or text()='Xem thêm')]",
+                )
+                for btn in see_more_btns:
+                    try:
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(random.uniform(0.5, 1.0))
                     except Exception: pass
             except Exception: pass
             curr_height = self.driver.execute_script("return document.body.scrollHeight")
@@ -1030,7 +1152,29 @@ class ThreadsCrawler:
             "Repost", "More", "Follow", "Theo dõi", "Log in", "Đăng nhập",
             "Sign up", "Đăng ký", "Search", "Tìm kiếm", "Verified",
             "liked", "likes", "replies", "reply",
+            # Threads-specific UI noise
+            "Translate", "translate", "Dịch",
+            "See translation", "Xem bản dịch",
+            "Tiếp tục với Instagram", "Continue with Instagram",
+            "Tiếp tục bằng Instagram", "Dùng ứng dụng", "Use app",
         }
+
+        # Pre-process: remove small emoji <img> tags to prevent alt text leak
+        # (e.g. <img alt="gia đình" width="16"> → garbage text)
+        for img in soup.select("img"):
+            width = img.get("width")
+            if width and str(width).isdigit() and int(width) <= 20:
+                img.decompose()
+            elif img.get("alt") and not img.get("src", "").startswith("http"):
+                # Inline emoji image with no real src → remove
+                img.decompose()
+
+        # Remove "Translate"/"Dịch" button elements from the DOM
+        for el in soup.select('span[role="link"], div[role="button"]'):
+            t = el.get_text(strip=True).lower()
+            if t in {"translate", "dịch", "see translation", "xem bản dịch"}:
+                el.decompose()
+
         blocks = soup.select('div[data-pressable-container="true"]')
         if blocks:
             for block in blocks:
@@ -1045,15 +1189,19 @@ class ThreadsCrawler:
                         texts.append(t)
                 if texts:
                     main_text = max(texts, key=len)
-                    if main_text not in seen:
+                    # Apply Threads-specific text cleaning
+                    main_text = _clean_threads_text(main_text)
+                    if main_text and main_text not in seen:
                         seen.add(main_text)
                         results.append(main_text)
         if not results:
             for el in soup.select('div[dir="auto"], span[dir="auto"]'):
                 t = el.get_text(strip=True)
                 if t and len(t) > 3 and t not in seen and t not in UI_TEXTS and not t.startswith("http"):
-                    seen.add(t)
-                    results.append(t)
+                    t = _clean_threads_text(t)
+                    if t and t not in seen:
+                        seen.add(t)
+                        results.append(t)
         return results
 
     def scrape_comments(self, url: str, max_scroll=None) -> List[str]:
@@ -1075,12 +1223,11 @@ class ThreadsCrawler:
             self._log(f"    [ERROR] {e}")
             return []
 
-    def crawl_keyword(self, keyword=None, persist: bool = True) -> List[str]:
+    def crawl_keyword(self, keyword=None) -> List[str]:
         keyword = keyword or self.keyword
         if not keyword: raise ValueError("keyword is required")
         if self.driver is None: self.get_driver()
 
-        output_path = self.get_output_path(keyword)
         urls = self.search_threads(keyword, self.max_posts)
         if not urls:
             self._log("[Threads] Không tìm thấy link nào.")
@@ -1119,9 +1266,6 @@ class ThreadsCrawler:
                 if processed_batch:
                     all_texts.extend(processed_batch)
                     self.comments.extend(processed_batch)
-                    if persist:
-                        count = _append_batch_to_csv(output_path, processed_batch)
-                        self._log(f"    [CSV] +{count} dòng -> {os.path.basename(output_path)}")
                     wh_rows = [{"text": t} for t in processed_batch]
                     wh_count = append_to_warehouse(wh_rows)
                     self._log(f"    [WAREHOUSE] +{wh_count} dòng")

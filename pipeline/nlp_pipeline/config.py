@@ -80,4 +80,14 @@ ADMIN_JUNK_PATTERNS = [
     r"sent from my phone[\s\S]*",
     r"gửi từ điện thoại[\s\S]*",
     r"More options.*",
+    # --- Threads-specific noise patterns ---
+    r"^hãy đăng nhập.*thread.*$",
+    r"^đăng nhập hoặc đăng ký.*$",
+    r"^tiếp tục (?:bằng|với) instagram$",
+    r"^continue with instagram$",
+    r"^chính sách quyền riêng tư.*$",
+    r"^privacy policy.*$",
+    r"^(?:đang trả lời|replying to)\s*<?.*$",
+    # "gia đình" repeated anomaly (emoji alt text leak from Threads)
+    r"(?:gia đình\s*){2,}",
 ]
