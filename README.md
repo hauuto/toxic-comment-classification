@@ -14,6 +14,29 @@ pip install poetry
 poetry install
 ```
 
+## Auto labeling bằng Gemini (Google AI Studio)
+
+### 1) Cấu hình API key
+- Tạo file `.env` ở root project (hoặc set biến môi trường hệ thống).
+- Thêm:
+```
+GEMINI_API_KEY=YOUR_KEY_HERE
+GEMINI_MODEL=gemini-2.0-flash
+```
+
+### 2) Chạy GUI (pipeline)
+- Tab Labeling sẽ tự dùng Gemini khi có `GEMINI_API_KEY`.
+- Nếu không có `GEMINI_API_KEY` thì giữ nguyên fallback sang LM Studio như trước.
+- Dữ liệu warehouse được chia thành cluster theo thứ tự từ trên xuống: **25.000 dòng = 1 cluster**.
+- Chọn cluster trong tab Labeling để chỉ gán nhãn đúng cluster đó.
+- Lịch sử cluster được lưu tại `pipeline/cluster_history.json`.
+
+### 3) Chạy CLI Gemini 3-tier
+```
+python pipeline/run_gemini_labeling_3tier.py --resume
+```
+Output giữ nguyên format 3-tier: `id,text,tier1_spam,tier2_toxic,tier3_labels` (Tier3 join bằng `|`).
+
 ### Kiểm tra Poetry
 ```
 poetry env info

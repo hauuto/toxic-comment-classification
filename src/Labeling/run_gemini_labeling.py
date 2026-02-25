@@ -1,7 +1,11 @@
 import os
 import argparse
 import pandas as pd
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv  # type: ignore
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
 from tqdm import tqdm
 
 from .gemini_classifier import GeminiClassifier

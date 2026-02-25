@@ -19,7 +19,11 @@ from typing import List, Optional
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 from ddgs import DDGS
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv  # type: ignore
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import undetected_chromedriver as uc
