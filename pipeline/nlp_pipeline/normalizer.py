@@ -13,6 +13,7 @@ import json
 import re
 import unicodedata
 from .config import MAX_REPEAT_CHARS, MAX_REPEAT_PUNCTUATION, VIA_SIGNATURES
+from underthesea import text_normalize
 
 
 class Normalizer:
@@ -150,7 +151,7 @@ class Normalizer:
         # <date>, <num> should not be split or lowercased internally.
         # We protect them by temporarily replacing with safe tokens during processing.
         self._placeholder_pattern = re.compile(
-            r"<(?:url|mention|hashtag|email|date|num)>",
+            r"<(?:url|mention|hashtag|email|date|time|num|ip)>",
             re.IGNORECASE,
         )
 
@@ -230,7 +231,9 @@ class Normalizer:
 
     def normalize_timestamps(self, text: str) -> str:
         """Replace time expressions (HH:MM or HH:MM:SS) with <TIME> token."""
-        return self._timestamp_pattern.sub("<TIME>", text)
+        # Use lowercase placeholder for consistency with other normalizer placeholders;
+        # the pipeline canonicalizes it to <TIME> after segmentation.
+        return self._timestamp_pattern.sub("<time>", text)
 
     def normalize_numbers(self, text: str) -> str:
         """Normalize numerical expressions.
@@ -276,4 +279,5 @@ class Normalizer:
         text = self.normalize_case(text)
         text = self.normalize_abbreviations(text)
         text = self.normalize_whitespace(text)
+        text = text_normalize(text)
         return text

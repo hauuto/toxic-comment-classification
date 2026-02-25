@@ -10,6 +10,13 @@ Determines whether a comment should be kept or discarded based on content qualit
 """
 import re
 import unicodedata
+
+# Optional language detection via underthesea
+try:
+    from underthesea import lang_detect as _lang_detect
+    HAS_LANG_DETECT = True
+except Exception:
+    HAS_LANG_DETECT = False
 from .config import (
     MIN_CHAR_LENGTH,
     MIN_VIETNAMESE_RATIO,
@@ -21,7 +28,10 @@ from .config import (
 # Pure ASCII letters that are common English-only (not used in Vietnamese)
 _ASCII_LETTERS = re.compile(r"[a-zA-Z]+")
 # Vietnamese-specific diacritical characters (quick check set from config)
-_PLACEHOLDER_RE = re.compile(r"<(?:url|mention|hashtag|email|date|NUM|IP)>|:[a-z_]+:")
+_PLACEHOLDER_RE = re.compile(
+    r"<(?:url|mention|hashtag|email|date|time|num|ip)>|:[a-z_]+:",
+    re.IGNORECASE,
+)
 
 # Threads-specific UI noise patterns (pure username lines, login prompts)
 _THREADS_USERNAME_ONLY = re.compile(r"^[a-z0-9_.]{3,30}$")
@@ -48,12 +58,14 @@ class Filter:
         max_spam_repeat: int = MAX_SPAM_REPEAT,
         min_raw_chars: int = 20,
         max_english_ratio: float = 0.80,
+        require_vietnamese_lang: bool = True,
     ):
         self.min_char_length = min_char_length
         self.min_viet_ratio = min_viet_ratio
         self.max_spam_repeat = max_spam_repeat
         self.min_raw_chars = min_raw_chars
         self.max_english_ratio = max_english_ratio
+        self.require_vietnamese_lang = require_vietnamese_lang
 
         # Pattern for spam: same char repeated excessively (e.g., aaaaaaaaaa)
         self._spam_pattern = re.compile(r"(.)\1{" + str(max_spam_repeat) + r",}")
@@ -65,6 +77,33 @@ class Filter:
         self._admin_junk_pattern = re.compile(
             "|".join(ADMIN_JUNK_PATTERNS), re.IGNORECASE | re.MULTILINE
         )
+
+        # Precompiled cleanup for language detection (remove tokens / placeholders)
+        self._langdetect_cleanup = re.compile(
+            r"<[^>]+>|:[a-z_]+:|\s+",
+            re.IGNORECASE,
+        )
+
+    def _is_vietnamese_by_lang_detect(self, text: str) -> tuple[bool | None, str]:
+        """Return (is_vi or None, lang_code).
+
+        - None means lang_detect isn't available or text is too short to be reliable.
+        """
+        if not self.require_vietnamese_lang or not HAS_LANG_DETECT:
+            return None, ""
+
+        # Avoid aggressive filtering on very short texts
+        if not text or len(text) < 30:
+            return None, ""
+
+        try:
+            cleaned = self._langdetect_cleanup.sub(" ", text).strip()
+            if len(cleaned) < 20:
+                return None, ""
+            lang = _lang_detect(cleaned)
+            return (lang == "vi"), str(lang)
+        except Exception:
+            return None, ""
 
     # ------------------------------------------------------------------
     # Individual checks
@@ -133,7 +172,12 @@ class Filter:
     def has_enough_vietnamese(self, text: str) -> bool:
         """Check if comment has sufficient Vietnamese characters."""
         cleaned = self._token_pattern.sub("", text)
-        cleaned = re.sub(r"<(?:url|mention|hashtag|date|NUM|IP)>", "", cleaned)
+        cleaned = re.sub(
+            r"<(?:url|mention|hashtag|email|date|time|num|ip)>",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
         cleaned = re.sub(r"\s+", "", cleaned)
 
         if len(cleaned) == 0:
@@ -194,6 +238,11 @@ class Filter:
         # Threads UI noise check (login prompts, username-only lines)
         if self.is_threads_ui_noise(text):
             return False, "threads_ui_noise"
+
+        # Language detection (explicit Vietnamese vs non-Vietnamese)
+        is_vi, lang = self._is_vietnamese_by_lang_detect(text)
+        if is_vi is False:
+            return False, f"lang_not_vi:{lang}"
 
         # Raw length check (before normalize) — uses text if raw_text not given
         check_raw = raw_text if raw_text is not None else text

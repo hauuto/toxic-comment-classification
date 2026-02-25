@@ -11,8 +11,10 @@ Placeholders like <url>, <mention>, <hashtag>, <email>, <date>, <NUM>
 are protected from being split during segmentation.
 """
 
+import os
 import re
-from typing import Optional
+import threading
+from typing import Optional, Any
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeout
 
 # One persistent thread for VnCoreNLP calls (JVM is not thread-safe anyway)
@@ -33,13 +35,40 @@ except ImportError:
     HAS_VNCORENLP = False
 
 
-# Placeholder pattern: matches <url>, <mention>, <hashtag>, <email>, <date>, <NUM>
+# ============================================================================
+#  Shared VnCoreNLP model cache (heavy JVM init) – reuse across the app
+# ============================================================================
+
+_vncore_model_lock = threading.Lock()
+_vncore_model_cache: dict[str, Any] = {}
+
+
+def _get_or_create_vncorenlp_model(vncorenlp_dir: str, auto_download: bool) -> Any:
+    """Return a cached py_vncorenlp.VnCoreNLP instance for *vncorenlp_dir*."""
+    key = os.path.abspath(vncorenlp_dir)
+    with _vncore_model_lock:
+        if key in _vncore_model_cache:
+            return _vncore_model_cache[key]
+
+        # Create under the same lock to ensure single JVM init.
+        if auto_download:
+            try:
+                py_vncorenlp.download_model(save_dir=vncorenlp_dir)
+            except Exception:
+                pass
+
+        model = py_vncorenlp.VnCoreNLP(save_dir=vncorenlp_dir)
+        _vncore_model_cache[key] = model
+        return model
+
+
+# Placeholder pattern: matches placeholder tags like <url>, <mention>, <num>, <ip>...
 # and emoji tokens like :cười_ra_nước_mắt:, as well as English contractions like don't, we're
 _PLACEHOLDER_RE = re.compile(
-    r"<(?:url|mention|hashtag|email|date|NUM)>|"
+    r"<(?:url|mention|hashtag|email|date|time|num|ip)>|"
     r":[a-zA-Z0-9_àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]+:|"
     r"(?<!\w)[a-zA-Z]+['’][a-zA-Z]+(?!\w)",
-    re.UNICODE,
+    re.UNICODE | re.IGNORECASE,
 )
 
 
@@ -50,6 +79,7 @@ class WordSegmentor:
         self,
         backend: str = "underthesea",
         vncorenlp_dir: Optional[str] = None,
+        vncorenlp_model: Any = None,
         auto_download: bool = True,
     ):
         """
@@ -65,7 +95,7 @@ class WordSegmentor:
         """
 
         self.backend_name = backend.lower()
-        self.vncorenlp_model = None
+        self.vncorenlp_model = vncorenlp_model
         self._vncore_timeout_streak = 0   # consecutive timeouts; triggers fallback after 3
         self._vncore_dead = False          # set True when JVM is considered unresponsive
 
@@ -74,7 +104,11 @@ class WordSegmentor:
         # =========================================================
         if self.backend_name == "vncorenlp":
 
-            if not HAS_VNCORENLP:
+            # If a model is injected, trust it and skip heavy init.
+            if self.vncorenlp_model is not None:
+                print("[WordSegmentor] Using injected VnCoreNLP model")
+            
+            elif not HAS_VNCORENLP:
                 print(
                     "[WordSegmentor] py_vncorenlp not installed. "
                     "Install with: pip install py_vncorenlp"
@@ -90,16 +124,9 @@ class WordSegmentor:
 
             else:
                 try:
-                    # Auto-download model if requested
-                    if auto_download:
-                        try:
-                            py_vncorenlp.download_model(save_dir=vncorenlp_dir)
-                        except Exception:
-                            # Already exists → ignore
-                            pass
-
-                    self.vncorenlp_model = py_vncorenlp.VnCoreNLP(
-                        save_dir=vncorenlp_dir
+                    self.vncorenlp_model = _get_or_create_vncorenlp_model(
+                        vncorenlp_dir=vncorenlp_dir,
+                        auto_download=auto_download,
                     )
 
                     print(f"[WordSegmentor] Using py_vncorenlp at: {vncorenlp_dir}")

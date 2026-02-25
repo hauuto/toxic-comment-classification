@@ -11,6 +11,7 @@ from tkinter import messagebox, ttk
 from crawler import extract_comments_stream, VOZCrawler, ThreadsCrawler, load_keyword_history
 from nlp_pipeline.warehouse import append_to_warehouse, get_warehouse_count, read_warehouse, overwrite_warehouse
 from nlp_pipeline import VietnameseCommentPreprocessor
+from nlp_pipeline.word_segmentor import WordSegmentor
 from google_drive import upload_warehouse, download_warehouse
 from lmstudio_classifier import LMStudioClassifier
 
@@ -36,6 +37,87 @@ class App(ctk.CTk):
         self.is_running = False
         self.stop_event = threading.Event()
 
+        # Shared NLP resources (initialized once at app startup)
+        self._shared_vncorenlp_segmentor: WordSegmentor | None = None
+        self._preprocessor_cache: dict[str, VietnameseCommentPreprocessor] = {}
+        self._startup_error: str | None = None
+
+        # Defer building the full UI until VnCoreNLP is initialized
+        self.withdraw()
+        self._show_startup_loading()
+        threading.Thread(target=self._init_vncorenlp_startup, daemon=True).start()
+
+    # ---------------------------------------------------------
+    # STARTUP: VnCoreNLP init (single shared instance)
+    # ---------------------------------------------------------
+    def _show_startup_loading(self):
+        self._loading = ctk.CTkToplevel(self)
+        self._loading.title("Đang khởi động")
+        self._loading.geometry("520x200")
+        self._loading.resizable(False, False)
+        self._loading.attributes("-topmost", True)
+
+        try:
+            self._loading.grab_set()
+        except Exception:
+            pass
+
+        frame = ctk.CTkFrame(self._loading)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(
+            frame,
+            text="Đang khởi tạo VnCoreNLP (chỉ 1 lần khi mở app)...",
+            font=("Arial", 15, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
+
+        self._loading_status = ctk.CTkLabel(frame, text="Vui lòng đợi...", text_color="gray")
+        self._loading_status.pack(anchor="w", pady=(0, 10))
+
+        self._loading_bar = ctk.CTkProgressBar(frame)
+        self._loading_bar.pack(fill="x", pady=(5, 10))
+        self._loading_bar.configure(mode="indeterminate")
+        self._loading_bar.start()
+
+    def _init_vncorenlp_startup(self):
+        try:
+            models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+            self._shared_vncorenlp_segmentor = WordSegmentor(
+                backend="vncorenlp",
+                vncorenlp_dir=models_dir,
+                auto_download=False,
+            )
+            # Cache a preprocessor wired to the shared VnCoreNLP instance
+            self._preprocessor_cache["vncorenlp"] = VietnameseCommentPreprocessor(
+                segmentor=self._shared_vncorenlp_segmentor,
+                segmentor_backend="vncorenlp",
+                vncorenlp_dir=models_dir,
+            )
+        except Exception as e:
+            self._startup_error = str(e)
+        finally:
+            self.after(0, self._finish_startup)
+
+    def _finish_startup(self):
+        try:
+            self._loading_bar.stop()
+        except Exception:
+            pass
+        try:
+            self._loading.destroy()
+        except Exception:
+            pass
+
+        self.deiconify()
+
+        if self._startup_error:
+            messagebox.showwarning(
+                "Cảnh báo",
+                "Không thể khởi tạo VnCoreNLP lúc khởi động. "
+                "Bạn vẫn có thể chọn Underthesea để tách từ.\n\n"
+                f"Chi tiết: {self._startup_error}",
+            )
+
         # Create Tabview
         self.tabview = ctk.CTkTabview(self)
         self.tabview.pack(fill="both", expand=True, padx=20, pady=10)
@@ -55,6 +137,33 @@ class App(ctk.CTk):
         self._setup_label_manager_tab()
         self._setup_file_manager_tab()
         self._setup_config_tab()
+
+    def _get_preprocessor(self, segmentor_backend: str) -> VietnameseCommentPreprocessor:
+        backend = (segmentor_backend or "").lower().strip() or "vncorenlp"
+        if backend in self._preprocessor_cache:
+            return self._preprocessor_cache[backend]
+
+        if backend == "whitespace":
+            pp = VietnameseCommentPreprocessor(segmentor_backend="whitespace")
+            self._preprocessor_cache[backend] = pp
+            return pp
+
+        if backend == "underthesea":
+            pp = VietnameseCommentPreprocessor(segmentor_backend="underthesea")
+            self._preprocessor_cache[backend] = pp
+            return pp
+
+        models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        if self._shared_vncorenlp_segmentor is not None:
+            pp = VietnameseCommentPreprocessor(
+                segmentor=self._shared_vncorenlp_segmentor,
+                segmentor_backend="vncorenlp",
+                vncorenlp_dir=models_dir,
+            )
+        else:
+            pp = VietnameseCommentPreprocessor(segmentor_backend="vncorenlp", vncorenlp_dir=models_dir)
+        self._preprocessor_cache["vncorenlp"] = pp
+        return pp
 
     # ---------------------------------------------------------
     # TAB 1: CRAWLER
@@ -85,7 +194,7 @@ class App(ctk.CTk):
         self.use_decoder_var = ctk.BooleanVar(value=True)
         self.use_filter_var = ctk.BooleanVar(value=True)
         self.use_normalizer_var = ctk.BooleanVar(value=True)
-        self.use_segmentor_var = ctk.BooleanVar(value=True)
+        self.seg_backend_var = ctk.StringVar(value="VnCoreNLP")
         
         nlp_frame = ctk.CTkFrame(opt_frame, fg_color="transparent")
         nlp_frame.pack(side="left", fill="x", expand=True)
@@ -97,8 +206,14 @@ class App(ctk.CTk):
         self.chk_fil.pack(side="left", padx=5)
         self.chk_nor = ctk.CTkCheckBox(nlp_frame, text="Normalizer", variable=self.use_normalizer_var)
         self.chk_nor.pack(side="left", padx=5)
-        self.chk_seg = ctk.CTkCheckBox(nlp_frame, text="VnCoreNLP Segmentor", variable=self.use_segmentor_var)
-        self.chk_seg.pack(side="left", padx=5)
+        ctk.CTkLabel(nlp_frame, text="Tách từ:").pack(side="left", padx=(10, 5))
+        self.seg_backend_menu = ctk.CTkOptionMenu(
+            nlp_frame,
+            values=["Tắt", "VnCoreNLP", "Underthesea"],
+            variable=self.seg_backend_var,
+            width=130,
+        )
+        self.seg_backend_menu.pack(side="left", padx=5)
 
         # Buttons
         btn_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
@@ -201,7 +316,7 @@ class App(ctk.CTk):
         self.kw_dec_var = ctk.BooleanVar(value=True)
         self.kw_fil_var = ctk.BooleanVar(value=True)
         self.kw_nor_var = ctk.BooleanVar(value=True)
-        self.kw_seg_var = ctk.BooleanVar(value=True)
+        self.kw_seg_backend_var = ctk.StringVar(value="VnCoreNLP")
 
         self.kw_chk_dec = ctk.CTkCheckBox(nlp_frame, text="Decoder", variable=self.kw_dec_var)
         self.kw_chk_dec.pack(side="left", padx=5)
@@ -209,8 +324,14 @@ class App(ctk.CTk):
         self.kw_chk_fil.pack(side="left", padx=5)
         self.kw_chk_nor = ctk.CTkCheckBox(nlp_frame, text="Normalizer", variable=self.kw_nor_var)
         self.kw_chk_nor.pack(side="left", padx=5)
-        self.kw_chk_seg = ctk.CTkCheckBox(nlp_frame, text="VnCoreNLP Segmentor", variable=self.kw_seg_var)
-        self.kw_chk_seg.pack(side="left", padx=5)
+        ctk.CTkLabel(nlp_frame, text="Tách từ:").pack(side="left", padx=(10, 5))
+        self.kw_seg_backend_menu = ctk.CTkOptionMenu(
+            nlp_frame,
+            values=["Tắt", "VnCoreNLP", "Underthesea"],
+            variable=self.kw_seg_backend_var,
+            width=130,
+        )
+        self.kw_seg_backend_menu.pack(side="left", padx=5)
 
         # Buttons
         btn_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
@@ -357,7 +478,7 @@ class App(ctk.CTk):
             self.kw_chk_dec.configure(state="disabled")
             self.kw_chk_fil.configure(state="disabled")
             self.kw_chk_nor.configure(state="disabled")
-            self.kw_chk_seg.configure(state="disabled")
+            self.kw_seg_backend_menu.configure(state="disabled")
             self.kw_is_running = True
         else:
             self.kw_run_button.configure(state="normal", text="Bắt Đầu")
@@ -367,20 +488,29 @@ class App(ctk.CTk):
             self.kw_chk_dec.configure(state="normal")
             self.kw_chk_fil.configure(state="normal")
             self.kw_chk_nor.configure(state="normal")
-            self.kw_chk_seg.configure(state="normal")
+            self.kw_seg_backend_menu.configure(state="normal")
             self.kw_is_running = False
             self.refresh_file_list()
             self.refresh_keyword_history()
 
-    def _keyword_crawl_thread(self, keywords, platform, u_dec, u_fil, u_nor, u_seg,
-                               max_threads, max_pages, max_posts, max_scroll):
+    def _keyword_crawl_thread(
+        self,
+        keywords,
+        platform,
+        u_dec,
+        u_fil,
+        u_nor,
+        use_segmentor,
+        preprocessor,
+        max_threads,
+        max_pages,
+        max_posts,
+        max_scroll,
+    ):
         crawler = None
         try:
-            # Init NLP preprocessor once for all keywords
-            preprocessor = None
-            if u_dec or u_fil or u_nor or u_seg:
+            if preprocessor is not None:
                 self.after(0, self.kw_log_message, "Đang khởi tạo bộ tiền xử lý NLP...")
-                preprocessor = VietnameseCommentPreprocessor()
 
             log_cb = lambda msg: self.after(0, self.kw_log_message, msg)
 
@@ -409,7 +539,7 @@ class App(ctk.CTk):
                         use_decoder=u_dec,
                         use_filter=u_fil,
                         use_normalizer=u_nor,
-                        use_segmentor=u_seg,
+                        use_segmentor=use_segmentor,
                     )
                 else:
                     crawler = ThreadsCrawler(
@@ -423,7 +553,7 @@ class App(ctk.CTk):
                         use_decoder=u_dec,
                         use_filter=u_fil,
                         use_normalizer=u_nor,
-                        use_segmentor=u_seg,
+                        use_segmentor=use_segmentor,
                     )
 
                 self.kw_active_crawler = crawler
@@ -466,7 +596,20 @@ class App(ctk.CTk):
         u_dec = self.kw_dec_var.get()
         u_fil = self.kw_fil_var.get()
         u_nor = self.kw_nor_var.get()
-        u_seg = self.kw_seg_var.get()
+        seg_choice = (self.kw_seg_backend_var.get() or "").strip()
+        if seg_choice == "Underthesea":
+            segmentor_backend = "underthesea"
+            use_segmentor = True
+        elif seg_choice == "VnCoreNLP":
+            segmentor_backend = "vncorenlp"
+            use_segmentor = True
+        else:
+            segmentor_backend = "whitespace"
+            use_segmentor = False
+
+        preprocessor = None
+        if u_dec or u_fil or u_nor or use_segmentor:
+            preprocessor = self._get_preprocessor(segmentor_backend)
 
         max_threads = int(self.kw_max_threads_var.get() or 10)
         max_pages = int(self.kw_max_pages_var.get() or 50)
@@ -488,7 +631,7 @@ class App(ctk.CTk):
 
         thread = threading.Thread(
             target=self._keyword_crawl_thread,
-            args=(keywords, platform, u_dec, u_fil, u_nor, u_seg,
+            args=(keywords, platform, u_dec, u_fil, u_nor, use_segmentor, preprocessor,
                   max_threads, max_pages, max_posts, max_scroll),
             daemon=True,
         )
@@ -543,12 +686,19 @@ class App(ctk.CTk):
         self.wh_dec_var = ctk.BooleanVar(value=True)
         self.wh_fil_var = ctk.BooleanVar(value=True)
         self.wh_nor_var = ctk.BooleanVar(value=True)
-        self.wh_seg_var = ctk.BooleanVar(value=False)
+        self.wh_seg_backend_var = ctk.StringVar(value="Tắt")
 
         ctk.CTkCheckBox(row2, text="Decoder", variable=self.wh_dec_var).pack(side="left", padx=4)
         ctk.CTkCheckBox(row2, text="Filter", variable=self.wh_fil_var).pack(side="left", padx=4)
         ctk.CTkCheckBox(row2, text="Normalizer", variable=self.wh_nor_var).pack(side="left", padx=4)
-        ctk.CTkCheckBox(row2, text="VnCoreNLP", variable=self.wh_seg_var).pack(side="left", padx=4)
+        ctk.CTkLabel(row2, text="Tách từ:").pack(side="left", padx=(10, 5))
+        self.wh_seg_backend_menu = ctk.CTkOptionMenu(
+            row2,
+            values=["Tắt", "VnCoreNLP", "Underthesea"],
+            variable=self.wh_seg_backend_var,
+            width=130,
+        )
+        self.wh_seg_backend_menu.pack(side="left", padx=4)
 
         ctk.CTkButton(row2, text="▶ Chạy Preprocessing", width=150,
                        fg_color="#2563EB", hover_color="#1D4ED8",
@@ -708,9 +858,18 @@ class App(ctk.CTk):
         u_dec = self.wh_dec_var.get()
         u_fil = self.wh_fil_var.get()
         u_nor = self.wh_nor_var.get()
-        u_seg = self.wh_seg_var.get()
+        seg_choice = (self.wh_seg_backend_var.get() or "").strip()
+        if seg_choice == "Underthesea":
+            segmentor_backend = "underthesea"
+            use_segmentor = True
+        elif seg_choice == "VnCoreNLP":
+            segmentor_backend = "vncorenlp"
+            use_segmentor = True
+        else:
+            segmentor_backend = "whitespace"
+            use_segmentor = False
 
-        if not (u_dec or u_fil or u_nor or u_seg):
+        if not (u_dec or u_fil or u_nor or use_segmentor):
             messagebox.showwarning("Nhắc nhở", "Hãy chọn ít nhất 1 bước tiền xử lý.")
             return
 
@@ -719,7 +878,7 @@ class App(ctk.CTk):
 
         def _process():
             try:
-                preprocessor = VietnameseCommentPreprocessor()
+                preprocessor = self._get_preprocessor(segmentor_backend)
                 total = len(self._wh_all_rows)
                 kept = []
                 removed_count = 0
@@ -731,7 +890,7 @@ class App(ctk.CTk):
                         continue
                     result = preprocessor.process_comment(
                         text, use_decoder=u_dec, use_filter=u_fil,
-                        use_normalizer=u_nor, use_segmentor=u_seg,
+                        use_normalizer=u_nor, use_segmentor=use_segmentor,
                     )
                     if result["is_valid"]:
                         kept.append({"id": len(kept) + 1, "text": result["cleaned_text"]})
@@ -1630,7 +1789,7 @@ class App(ctk.CTk):
             self.chk_dec.configure(state="disabled")
             self.chk_fil.configure(state="disabled")
             self.chk_nor.configure(state="disabled")
-            self.chk_seg.configure(state="disabled")
+            self.seg_backend_menu.configure(state="disabled")
             self.is_running = True
         else:
             self.run_button.configure(state="normal", text="Bắt Đầu")
@@ -1639,11 +1798,11 @@ class App(ctk.CTk):
             self.chk_dec.configure(state="normal")
             self.chk_fil.configure(state="normal")
             self.chk_nor.configure(state="normal")
-            self.chk_seg.configure(state="normal")
+            self.seg_backend_menu.configure(state="normal")
             self.is_running = False
             self.refresh_file_list()
 
-    def _crawl_thread(self, url, headless, u_dec, u_fil, u_nor, u_seg):
+    def _crawl_thread(self, url, headless, u_dec, u_fil, u_nor, use_segmentor, segmentor_backend, preprocessor):
         try:
             extract_comments_stream(
                 url_input=url,
@@ -1651,7 +1810,9 @@ class App(ctk.CTk):
                 use_decoder=u_dec,
                 use_filter=u_fil,
                 use_normalizer=u_nor,
-                use_segmentor=u_seg,
+                use_segmentor=use_segmentor,
+                segmentor_backend=segmentor_backend,
+                preprocessor=preprocessor,
                 log_callback=lambda msg: self.after(0, self.log_message, msg),
                 data_callback=self.handle_new_data,
                 stop_event=self.stop_event
@@ -1674,7 +1835,20 @@ class App(ctk.CTk):
         u_dec = self.use_decoder_var.get()
         u_fil = self.use_filter_var.get()
         u_nor = self.use_normalizer_var.get()
-        u_seg = self.use_segmentor_var.get()
+        seg_choice = (self.seg_backend_var.get() or "").strip()
+        if seg_choice == "Underthesea":
+            segmentor_backend = "underthesea"
+            use_segmentor = True
+        elif seg_choice == "VnCoreNLP":
+            segmentor_backend = "vncorenlp"
+            use_segmentor = True
+        else:
+            segmentor_backend = "whitespace"
+            use_segmentor = False
+
+        preprocessor = None
+        if u_dec or u_fil or u_nor or use_segmentor:
+            preprocessor = self._get_preprocessor(segmentor_backend)
 
         self.extracted_data = []
         self.tree_data.delete(*self.tree_data.get_children())
@@ -1687,7 +1861,7 @@ class App(ctk.CTk):
         self.log_message("Dữ liệu sẽ được lưu trực tiếp vào warehouse.csv")
 
         thread = threading.Thread(target=self._crawl_thread,
-                                  args=(url_input, headless, u_dec, u_fil, u_nor, u_seg),
+                                  args=(url_input, headless, u_dec, u_fil, u_nor, use_segmentor, segmentor_backend, preprocessor),
                                   daemon=True)
         thread.start()
 

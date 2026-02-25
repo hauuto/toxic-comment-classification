@@ -29,11 +29,11 @@ except ImportError:
     HAS_VNCORENLP = False
 
 
-# Placeholder pattern: matches <url>, <mention>, <hashtag>, <email>, <date>, <NUM>
+# Placeholder pattern: matches placeholder tags like <url>, <mention>, <num>, <ip>...
 # and emoji tokens like :cười_ra_nước_mắt:
 _PLACEHOLDER_RE = re.compile(
-    r"<(?:url|mention|hashtag|email|date|NUM)>|:[a-zA-Z0-9_àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]+:",
-    re.UNICODE,
+    r"<(?:url|mention|hashtag|email|date|time|num|ip)>|:[a-zA-Z0-9_àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]+:",
+    re.UNICODE | re.IGNORECASE,
 )
 
 

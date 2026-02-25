@@ -667,6 +667,8 @@ def extract_comments_stream(url_input: str, headless: bool = False,
                             use_filter: bool = True,
                             use_normalizer: bool = True,
                             use_segmentor: bool = True,
+                            segmentor_backend: str = "vncorenlp",
+                            preprocessor: VietnameseCommentPreprocessor | None = None,
                             log_callback=None, data_callback=None, stop_event=None):
     """
     Crawls comments from URLs (FB, YT, TikTok, Threads). Semicolon-separated.
@@ -689,11 +691,12 @@ def extract_comments_stream(url_input: str, headless: bool = False,
     current_id = 1
     
     try:
-        if use_decoder or use_filter or use_normalizer or use_segmentor:
-            log("Đang khởi tạo bộ tiền xử lý NLP (VnCoreNLP)... Vui lòng đợi vài giây...")
-            preprocessor = VietnameseCommentPreprocessor()
-        else:
-            preprocessor = None
+        if preprocessor is None:
+            if use_decoder or use_filter or use_normalizer or use_segmentor:
+                log("Đang khởi tạo bộ tiền xử lý NLP... Vui lòng đợi vài giây...")
+                preprocessor = VietnameseCommentPreprocessor(segmentor_backend=segmentor_backend)
+            else:
+                preprocessor = None
             
         with sync_playwright() as p:
             log("Mở trình duyệt...")
