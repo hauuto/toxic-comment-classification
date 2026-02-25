@@ -11,6 +11,9 @@ from tkinter import messagebox, ttk
 from crawler import extract_comments_stream, VOZCrawler, ThreadsCrawler, load_keyword_history
 from nlp_pipeline.warehouse import append_to_warehouse, get_warehouse_count, read_warehouse, overwrite_warehouse
 from nlp_pipeline import VietnameseCommentPreprocessor
+from google_drive import upload_warehouse, download_warehouse, upload_labeled_data, download_labeled_data
+from lmstudio_classifier import (LMStudioClassifier, TIER1_LABELS, TIER2_LABELS,
+                                  TIER3_TOXIC_LABELS, TIER3_CLEAN_LABELS, TIER3_ALL_LABELS)
 from nlp_pipeline.word_segmentor import WordSegmentor
 from google_drive import upload_warehouse, download_warehouse
 from lmstudio_classifier import LMStudioClassifier
@@ -1043,6 +1046,11 @@ class App(ctk.CTk):
                                            state="disabled", command=self._lbl_stop_labeling)
         self.lbl_stop_btn.pack(side="left", padx=5)
 
+        self.lbl_reset_btn = ctk.CTkButton(ctrl_frame, text="🔄 Reset", width=80,
+                                            fg_color="#6B7280", hover_color="#4B5563",
+                                            command=self._lbl_reset_labeled_data)
+        self.lbl_reset_btn.pack(side="left", padx=5)
+
         self.lbl_progress_var = ctk.DoubleVar(value=0.0)
         self.lbl_progress = ctk.CTkProgressBar(ctrl_frame, variable=self.lbl_progress_var, width=250)
         self.lbl_progress.pack(side="left", padx=(15, 5))
@@ -1067,13 +1075,17 @@ class App(ctk.CTk):
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
 
-        self.lbl_tree = ttk.Treeview(table_frame, columns=("id", "text", "label"), show="headings")
+        self.lbl_tree = ttk.Treeview(table_frame, columns=("id", "text", "tier1", "tier2", "tier3"), show="headings")
         self.lbl_tree.heading("id", text="ID")
         self.lbl_tree.heading("text", text="Nội dung bình luận")
-        self.lbl_tree.heading("label", text="Nhãn")
-        self.lbl_tree.column("id", width=50, anchor="center")
-        self.lbl_tree.column("text", width=500, anchor="w")
-        self.lbl_tree.column("label", width=100, anchor="center")
+        self.lbl_tree.heading("tier1", text="Tier1 Spam")
+        self.lbl_tree.heading("tier2", text="Tier2 Toxic")
+        self.lbl_tree.heading("tier3", text="Tier3 Labels")
+        self.lbl_tree.column("id", width=40, anchor="center")
+        self.lbl_tree.column("text", width=350, anchor="w")
+        self.lbl_tree.column("tier1", width=80, anchor="center")
+        self.lbl_tree.column("tier2", width=80, anchor="center")
+        self.lbl_tree.column("tier3", width=150, anchor="center")
 
         lbl_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.lbl_tree.yview)
         self.lbl_tree.configure(yscrollcommand=lbl_scroll.set)
@@ -1144,6 +1156,7 @@ class App(ctk.CTk):
         self._lbl_is_running = True
         self.lbl_start_btn.configure(state="disabled", text="Đang chạy...")
         self.lbl_stop_btn.configure(state="normal")
+        self.lbl_reset_btn.configure(state="disabled")
         self.lbl_endpoint_entry.configure(state="disabled")
         self.lbl_model_entry.configure(state="disabled")
 
@@ -1158,15 +1171,87 @@ class App(ctk.CTk):
             import pandas as pd
             classifier = LMStudioClassifier(endpoint=endpoint, model=model_name, timeout=120)
             labeled_path = self._get_labeled_data_path()
+
+            # --- Load existing labeled data for resume support ---
+            labeled_ids = set()
+            existing_rows = []
+            label_counts = {}
+            file_exists = False
+
             if os.path.exists(labeled_path):
                 try:
-                    os.remove(labeled_path)
+                    with open(labeled_path, "r", encoding="utf-8-sig") as f:
+                        reader = csv.DictReader(f)
+                        for erow in reader:
+                            try:
+                                eid = int(erow.get("id", 0))
+                            except (ValueError, TypeError):
+                                eid = 0
+                            labeled_ids.add(eid)
+                            existing_rows.append(erow)
+                            # Rebuild label_counts from existing data
+                            t1 = erow.get("tier1_spam", "")
+                            t2 = erow.get("tier2_toxic", "")
+                            t3_str = erow.get("tier3_labels", "")
+                            if t1:
+                                label_counts[t1] = label_counts.get(t1, 0) + 1
+                            if t2:
+                                label_counts[t2] = label_counts.get(t2, 0) + 1
+                            if t3_str:
+                                for lbl in t3_str.split("|"):
+                                    lbl = lbl.strip()
+                                    if lbl:
+                                        label_counts[lbl] = label_counts.get(lbl, 0) + 1
+                    file_exists = len(labeled_ids) > 0
                 except Exception:
                     pass
-            file_exists = False
+
+            skipped = len(labeled_ids)
             total = len(rows)
-            processed = 0
-            label_counts = {}
+
+            # Pre-populate treeview with existing labeled rows
+            if existing_rows:
+                for erow in existing_rows:
+                    rid = erow.get("id", "")
+                    dt = str(erow.get("text", "")).replace("\n", "  ")[:80]
+                    s1 = erow.get("tier1_spam", "")
+                    s2 = erow.get("tier2_toxic", "")
+                    s3 = erow.get("tier3_labels", "")
+                    self.after(0, lambda r=rid, d=dt, a1=s1, a2=s2, a3=s3:
+                               self.lbl_tree.insert("", "end", values=(r, d, a1, a2, a3)))
+                self.after(0, self._lbl_log,
+                           f"♻ Tiếp tục từ {skipped}/{total} dòng đã gán nhãn trước đó")
+
+            # Filter pending rows (skip already labeled)
+            pending_rows = [r for r in rows if r.get("id") not in labeled_ids]
+
+            if not pending_rows:
+                self.after(0, self._lbl_log, f"✅ Tất cả {total} dòng đã được gán nhãn. Không cần làm gì thêm.")
+                stats_str = " | ".join(f"{k}: {v}" for k, v in label_counts.items())
+                if stats_str:
+                    self.after(0, self._lbl_log, f"   Thống kê: [{stats_str}]")
+                self.after(0, lambda: self.lbl_progress.set(1.0))
+                self.after(0, lambda t=total: self.lbl_progress_text.configure(text=f"{t} / {t}"))
+                final_msg = f"✅ Hoàn tất — {total} dòng đã gán nhãn → labeled_data.csv"
+                self.after(0, lambda: self.lbl_status_label.configure(text=final_msg, text_color="green"))
+                self._lbl_is_running = False
+                self.after(0, lambda: self.lbl_start_btn.configure(state="normal", text="▶ Bắt Đầu Gán Nhãn"))
+                self.after(0, lambda: self.lbl_stop_btn.configure(state="disabled"))
+                self.after(0, lambda: self.lbl_reset_btn.configure(state="normal"))
+                self.after(0, lambda: self.lbl_endpoint_entry.configure(state="normal"))
+                self.after(0, lambda: self.lbl_model_entry.configure(state="normal"))
+                self.after(0, self.refresh_file_list)
+                return
+
+            # Update progress to reflect already-labeled rows
+            processed = skipped
+            if skipped > 0:
+                p = skipped / total
+                self.after(0, lambda v=p: self.lbl_progress.set(v))
+                self.after(0, lambda v=skipped, t=total: self.lbl_progress_text.configure(text=f"{v} / {t}"))
+
+            self.after(0, self._lbl_log, f"📋 Còn {len(pending_rows)} dòng cần gán nhãn")
+
             buffer_rows = []
             buffer_tasks = []
 
@@ -1175,14 +1260,25 @@ class App(ctk.CTk):
                 predictions = classifier.predict(buffer_tasks)
                 csv_rows = []
                 for row_i, pred in zip(buffer_rows, predictions):
-                    label = pred["result"][0]["value"]["choices"][0]
-                    label_counts[label] = label_counts.get(label, 0) + 1
+                    t1 = pred["tier1_spam"]
+                    t2 = pred["tier2_toxic"]
+                    t3 = "|".join(pred["tier3_labels"]) if pred["tier3_labels"] else ""
+                    label_counts[t1] = label_counts.get(t1, 0) + 1
+                    label_counts[t2] = label_counts.get(t2, 0) + 1
+                    for lbl in pred["tier3_labels"]:
+                        label_counts[lbl] = label_counts.get(lbl, 0) + 1
                     processed += 1
-                    csv_rows.append({"id": row_i.get("id", processed), "text": row_i.get("text", ""), "label": label})
+                    csv_rows.append({
+                        "id": row_i.get("id", processed),
+                        "text": row_i.get("text", ""),
+                        "tier1_spam": t1,
+                        "tier2_toxic": t2,
+                        "tier3_labels": t3,
+                    })
                     rid = row_i.get("id", processed)
-                    dt = str(row_i.get("text", "")).replace("\n", "  ")[:100]
-                    lb = label
-                    self.after(0, lambda r=rid, d=dt, l=lb: self.lbl_tree.insert("", "end", values=(r, d, l)))
+                    dt = str(row_i.get("text", "")).replace("\n", "  ")[:80]
+                    self.after(0, lambda r=rid, d=dt, s1=t1, s2=t2, s3=t3:
+                               self.lbl_tree.insert("", "end", values=(r, d, s1, s2, s3)))
                 pd.DataFrame(csv_rows).to_csv(labeled_path, mode="a", header=not file_exists, index=False, encoding="utf-8-sig")
                 file_exists = True
                 p = processed / total
@@ -1193,7 +1289,7 @@ class App(ctk.CTk):
                 self.after(0, self._lbl_log, f"   ✓ Batch xong. [{stats_str}]")
 
             try:
-                for row in rows:
+                for row in pending_rows:
                     if self._lbl_stop_event.is_set():
                         self.after(0, self._lbl_log, "🛑 Đã nhận lệnh DỪNG. Dữ liệu đã gán được lưu.")
                         break
@@ -1208,12 +1304,13 @@ class App(ctk.CTk):
                 if buffer_tasks and not self._lbl_stop_event.is_set():
                     self.after(0, self._lbl_log, f"📤 Gửi batch cuối {processed + 1}–{processed + len(buffer_tasks)} / {total} ...")
                     _flush_batch()
+                newly_labeled = processed - skipped
                 self.after(0, self._lbl_log, "\n" + "=" * 50)
-                self.after(0, self._lbl_log, f"✅ HOÀN TẤT: {processed}/{total} bình luận đã gán nhãn")
+                self.after(0, self._lbl_log, f"✅ HOÀN TẤT: {processed}/{total} bình luận đã gán nhãn ({newly_labeled} mới gán)")
                 for lbl, cnt in label_counts.items():
                     self.after(0, self._lbl_log, f"   {lbl}: {cnt}")
                 self.after(0, self._lbl_log, f"📂 Đã lưu: {labeled_path}")
-                final_msg = f"✅ Hoàn tất — {processed} dòng đã gán nhãn → labeled_data.csv"
+                final_msg = f"✅ Hoàn tất — {processed}/{total} dòng đã gán nhãn ({newly_labeled} mới) → labeled_data.csv"
                 self.after(0, lambda: self.lbl_status_label.configure(text=final_msg, text_color="green"))
             except Exception as e:
                 err_msg = str(e)
@@ -1223,6 +1320,7 @@ class App(ctk.CTk):
                 self._lbl_is_running = False
                 self.after(0, lambda: self.lbl_start_btn.configure(state="normal", text="▶ Bắt Đầu Gán Nhãn"))
                 self.after(0, lambda: self.lbl_stop_btn.configure(state="disabled"))
+                self.after(0, lambda: self.lbl_reset_btn.configure(state="normal"))
                 self.after(0, lambda: self.lbl_endpoint_entry.configure(state="normal"))
                 self.after(0, lambda: self.lbl_model_entry.configure(state="normal"))
                 self.after(0, self.refresh_file_list)
@@ -1233,6 +1331,39 @@ class App(ctk.CTk):
             self._lbl_log("⏹ Đang gửi lệnh dừng...")
             self._lbl_stop_event.set()
             self.lbl_stop_btn.configure(state="disabled", text="Đang dừng...")
+
+    def _lbl_reset_labeled_data(self):
+        """Xóa labeled_data.csv và reset toàn bộ tiến trình gán nhãn."""
+        if self._lbl_is_running:
+            messagebox.showwarning("Lỗi", "Không thể reset khi đang gán nhãn! Hãy dừng trước.")
+            return
+        labeled_path = self._get_labeled_data_path()
+        if not os.path.exists(labeled_path):
+            messagebox.showinfo("Thông báo", "Chưa có file labeled_data.csv để xóa.")
+            return
+        confirm = messagebox.askyesno(
+            "Xác nhận Reset",
+            "Bạn có chắc chắn muốn xóa toàn bộ dữ liệu đã gán nhãn?\n\n"
+            "File labeled_data.csv sẽ bị xóa và bạn phải gán nhãn lại từ đầu.\n"
+            "Hành động này KHÔNG THỂ hoàn tác!",
+            icon="warning"
+        )
+        if not confirm:
+            return
+        try:
+            os.remove(labeled_path)
+            self.lbl_tree.delete(*self.lbl_tree.get_children())
+            self.lbl_progress.set(0)
+            self.lbl_progress_text.configure(text="0 / 0")
+            self.lbl_log_textbox.configure(state="normal")
+            self.lbl_log_textbox.delete("0.0", "end")
+            self.lbl_log_textbox.configure(state="disabled")
+            self._lbl_log("🔄 Đã reset — labeled_data.csv đã bị xóa.")
+            self._lbl_log("Sẵn sàng gán nhãn lại từ đầu.")
+            self.lbl_status_label.configure(text="🔄 Đã reset dữ liệu gán nhãn", text_color="orange")
+            self.refresh_file_list()
+        except Exception as e:
+            messagebox.showerror("Lỗi", f"Không thể xóa file: {e}")
 
     # ---------------------------------------------------------
     # TAB: LABEL MANAGER
@@ -1250,13 +1381,24 @@ class App(ctk.CTk):
         ctk.CTkButton(row1, text="⟳ Tải dữ liệu", width=110, command=self._lm_load_data).pack(side="left", padx=5)
         ctk.CTkLabel(row1, text="Tìm kiếm:").pack(side="left", padx=(15, 5))
         self.lm_search_var = ctk.StringVar()
-        ctk.CTkEntry(row1, textvariable=self.lm_search_var, placeholder_text="Nhập text để lọc...", width=200).pack(side="left", padx=5)
+        ctk.CTkEntry(row1, textvariable=self.lm_search_var, placeholder_text="Nhập text để lọc...", width=180).pack(side="left", padx=5)
         ctk.CTkButton(row1, text="Lọc", width=60, command=self._lm_filter_data).pack(side="left", padx=5)
-        ctk.CTkLabel(row1, text="Nhãn:").pack(side="left", padx=(10, 5))
-        self.lm_label_filter_var = ctk.StringVar(value="Tất cả")
-        self.lm_label_filter = ctk.CTkOptionMenu(row1, values=["Tất cả", "Clean", "Spam", "Hate Speech", "Harassment", "Obscene"],
-                                                   variable=self.lm_label_filter_var, command=lambda _: self._lm_filter_data(), width=120)
-        self.lm_label_filter.pack(side="left", padx=5)
+
+        ctk.CTkLabel(row1, text="Tier1:").pack(side="left", padx=(10, 3))
+        self.lm_t1_filter_var = ctk.StringVar(value="Tất cả")
+        ctk.CTkOptionMenu(row1, values=["Tất cả"] + TIER1_LABELS,
+                           variable=self.lm_t1_filter_var, command=lambda _: self._lm_filter_data(), width=100).pack(side="left", padx=2)
+
+        ctk.CTkLabel(row1, text="Tier2:").pack(side="left", padx=(8, 3))
+        self.lm_t2_filter_var = ctk.StringVar(value="Tất cả")
+        ctk.CTkOptionMenu(row1, values=["Tất cả"] + TIER2_LABELS,
+                           variable=self.lm_t2_filter_var, command=lambda _: self._lm_filter_data(), width=100).pack(side="left", padx=2)
+
+        ctk.CTkLabel(row1, text="Tier3:").pack(side="left", padx=(8, 3))
+        self.lm_t3_filter_var = ctk.StringVar(value="Tất cả")
+        ctk.CTkOptionMenu(row1, values=["Tất cả"] + TIER3_ALL_LABELS,
+                           variable=self.lm_t3_filter_var, command=lambda _: self._lm_filter_data(), width=120).pack(side="left", padx=2)
+
         ctk.CTkButton(row1, text="Xóa lọc", width=70, command=self._lm_clear_filter).pack(side="left", padx=5)
         self.lm_stats_label = ctk.CTkLabel(row1, text="Labeled: 0 dòng", text_color="gray")
         self.lm_stats_label.pack(side="right", padx=10)
@@ -1264,12 +1406,26 @@ class App(ctk.CTk):
         row2 = ctk.CTkFrame(header, fg_color="transparent")
         row2.pack(fill="x", padx=5, pady=(2, 5))
         ctk.CTkButton(row2, text="Xuất CSV", width=90, fg_color="#059669", hover_color="#047857", command=self._lm_export_csv).pack(side="left", padx=5)
-        ctk.CTkLabel(row2, text="Sửa nhãn →").pack(side="left", padx=(20, 5))
-        self.lm_edit_label_var = ctk.StringVar(value="Clean")
-        ctk.CTkOptionMenu(row2, values=["Clean", "Spam", "Hate Speech", "Harassment", "Obscene"],
-                           variable=self.lm_edit_label_var, width=120).pack(side="left", padx=2)
+
+        # --- Edit labels section ---
+        ctk.CTkLabel(row2, text="Sửa →").pack(side="left", padx=(20, 3))
+        ctk.CTkLabel(row2, text="T1:").pack(side="left", padx=(0, 2))
+        self.lm_edit_t1_var = ctk.StringVar(value="—")
+        ctk.CTkOptionMenu(row2, values=["—"] + TIER1_LABELS, variable=self.lm_edit_t1_var, width=95).pack(side="left", padx=2)
+        ctk.CTkLabel(row2, text="T2:").pack(side="left", padx=(5, 2))
+        self.lm_edit_t2_var = ctk.StringVar(value="—")
+        ctk.CTkOptionMenu(row2, values=["—"] + TIER2_LABELS, variable=self.lm_edit_t2_var, width=85).pack(side="left", padx=2)
+        ctk.CTkLabel(row2, text="T3:").pack(side="left", padx=(5, 2))
+        self.lm_edit_t3_var = ctk.StringVar(value="—")
+        ctk.CTkOptionMenu(row2, values=["—"] + TIER3_ALL_LABELS, variable=self.lm_edit_t3_var, width=120).pack(side="left", padx=2)
         ctk.CTkButton(row2, text="Áp dụng", width=80, fg_color="#7C3AED", hover_color="#6D28D9", command=self._lm_edit_label).pack(side="left", padx=5)
+
+        # --- Drive sync + delete ---
         ctk.CTkButton(row2, text="Xóa dòng chọn", width=110, fg_color="red", hover_color="darkred", command=self._lm_delete_selected).pack(side="right", padx=5)
+        ctk.CTkButton(row2, text="⬇ Drive", width=90, fg_color="#0284C7", hover_color="#0369A1",
+                       command=self._lm_download_drive).pack(side="right", padx=3)
+        ctk.CTkButton(row2, text="⬆ Drive", width=90, fg_color="#0284C7", hover_color="#0369A1",
+                       command=self._lm_upload_drive).pack(side="right", padx=3)
 
         main_frame = ctk.CTkFrame(tab)
         main_frame.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
@@ -1281,13 +1437,17 @@ class App(ctk.CTk):
         tf.grid(row=0, column=0, padx=(5, 3), pady=5, sticky="nsew")
         tf.grid_columnconfigure(0, weight=1)
         tf.grid_rowconfigure(0, weight=1)
-        self.lm_tree = ttk.Treeview(tf, columns=("id", "text", "label"), show="headings", selectmode="extended")
+        self.lm_tree = ttk.Treeview(tf, columns=("id", "text", "tier1", "tier2", "tier3"), show="headings", selectmode="extended")
         self.lm_tree.heading("id", text="ID")
         self.lm_tree.heading("text", text="Nội dung bình luận")
-        self.lm_tree.heading("label", text="Nhãn")
-        self.lm_tree.column("id", width=50, anchor="center")
-        self.lm_tree.column("text", width=400, anchor="w")
-        self.lm_tree.column("label", width=100, anchor="center")
+        self.lm_tree.heading("tier1", text="Tier1 Spam")
+        self.lm_tree.heading("tier2", text="Tier2 Toxic")
+        self.lm_tree.heading("tier3", text="Tier3 Labels")
+        self.lm_tree.column("id", width=40, anchor="center")
+        self.lm_tree.column("text", width=300, anchor="w")
+        self.lm_tree.column("tier1", width=80, anchor="center")
+        self.lm_tree.column("tier2", width=80, anchor="center")
+        self.lm_tree.column("tier3", width=130, anchor="center")
         lm_scroll = ttk.Scrollbar(tf, orient="vertical", command=self.lm_tree.yview)
         self.lm_tree.configure(yscrollcommand=lm_scroll.set)
         self.lm_tree.grid(row=0, column=0, sticky="nsew")
@@ -1303,6 +1463,7 @@ class App(ctk.CTk):
         self.lm_status_label = ctk.CTkLabel(tab, text="Trạng thái: Sẵn sàng", text_color="gray")
         self.lm_status_label.grid(row=2, column=0, pady=5, sticky="w", padx=10)
         self._lm_all_rows = []
+        self._lm_is_processing = False
         self._lm_load_data()
 
     def _lm_load_data(self):
@@ -1313,7 +1474,26 @@ class App(ctk.CTk):
                 with open(labeled_path, "r", encoding="utf-8-sig") as f:
                     reader = csv.DictReader(f)
                     for row in reader:
-                        self._lm_all_rows.append({"id": row.get("id", ""), "text": row.get("text", ""), "label": row.get("label", "Clean")})
+                        # New 3-tier format
+                        if "tier1_spam" in row:
+                            self._lm_all_rows.append({
+                                "id": row.get("id", ""),
+                                "text": row.get("text", ""),
+                                "tier1_spam": row.get("tier1_spam", "Not Spam"),
+                                "tier2_toxic": row.get("tier2_toxic", "Clean"),
+                                "tier3_labels": row.get("tier3_labels", ""),
+                            })
+                        else:
+                            # Backward compatibility: migrate old format (id, text, label)
+                            old_label = row.get("label", "Clean")
+                            t1, t2, t3 = self._migrate_old_label(old_label)
+                            self._lm_all_rows.append({
+                                "id": row.get("id", ""),
+                                "text": row.get("text", ""),
+                                "tier1_spam": t1,
+                                "tier2_toxic": t2,
+                                "tier3_labels": t3,
+                            })
             except Exception as e:
                 messagebox.showerror("Lỗi", f"Không thể đọc labeled_data.csv: {e}")
         self._lm_display_rows(self._lm_all_rows)
@@ -1324,25 +1504,52 @@ class App(ctk.CTk):
         else:
             self.lm_status_label.configure(text="Chưa có dữ liệu labeled_data.csv", text_color="gray")
 
+    @staticmethod
+    def _migrate_old_label(old_label: str):
+        """Migrate old single-label format to 3-tier. Returns (tier1, tier2, tier3_str)."""
+        old_label = old_label.strip()
+        if old_label == "Spam":
+            return "Spam", "Clean", "Neutral"
+        elif old_label in ("Hate Speech", "Harassment", "Obscene"):
+            return "Not Spam", "Toxic", old_label
+        elif old_label == "Clean":
+            return "Not Spam", "Clean", "Neutral"
+        else:
+            return "Not Spam", "Clean", "Neutral"
+
     def _lm_display_rows(self, rows):
         self.lm_tree.delete(*self.lm_tree.get_children())
         for row in rows:
-            self.lm_tree.insert("", "end", values=(row.get("id", ""), str(row.get("text", "")).replace("\n", "  "), row.get("label", "")))
+            self.lm_tree.insert("", "end", values=(
+                row.get("id", ""),
+                str(row.get("text", "")).replace("\n", "  "),
+                row.get("tier1_spam", ""),
+                row.get("tier2_toxic", ""),
+                row.get("tier3_labels", ""),
+            ))
 
     def _lm_filter_data(self):
         query = self.lm_search_var.get().strip().lower()
-        label_filter = self.lm_label_filter_var.get()
+        t1_filter = self.lm_t1_filter_var.get()
+        t2_filter = self.lm_t2_filter_var.get()
+        t3_filter = self.lm_t3_filter_var.get()
         filtered = self._lm_all_rows
         if query:
             filtered = [r for r in filtered if query in r.get("text", "").lower()]
-        if label_filter != "Tất cả":
-            filtered = [r for r in filtered if r.get("label", "") == label_filter]
+        if t1_filter != "Tất cả":
+            filtered = [r for r in filtered if r.get("tier1_spam", "") == t1_filter]
+        if t2_filter != "Tất cả":
+            filtered = [r for r in filtered if r.get("tier2_toxic", "") == t2_filter]
+        if t3_filter != "Tất cả":
+            filtered = [r for r in filtered if t3_filter in r.get("tier3_labels", "").split("|")]
         self._lm_display_rows(filtered)
         self.lm_status_label.configure(text=f"Hiển thị {len(filtered)}/{len(self._lm_all_rows)} dòng", text_color="blue")
 
     def _lm_clear_filter(self):
         self.lm_search_var.set("")
-        self.lm_label_filter_var.set("Tất cả")
+        self.lm_t1_filter_var.set("Tất cả")
+        self.lm_t2_filter_var.set("Tất cả")
+        self.lm_t3_filter_var.set("Tất cả")
         self._lm_display_rows(self._lm_all_rows)
         self.lm_status_label.configure(text=f"Hiển thị tất cả {len(self._lm_all_rows)} dòng", text_color="green")
 
@@ -1350,7 +1557,7 @@ class App(ctk.CTk):
         labeled_path = self._get_labeled_data_path()
         try:
             with open(labeled_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=["id", "text", "label"])
+                writer = csv.DictWriter(f, fieldnames=["id", "text", "tier1_spam", "tier2_toxic", "tier3_labels"])
                 writer.writeheader()
                 writer.writerows(self._lm_all_rows)
         except Exception as e:
@@ -1380,7 +1587,12 @@ class App(ctk.CTk):
         if not selected:
             messagebox.showwarning("Nhắc nhở", "Hãy chọn ít nhất 1 dòng để sửa nhãn.")
             return
-        new_label = self.lm_edit_label_var.get()
+        new_t1 = self.lm_edit_t1_var.get()
+        new_t2 = self.lm_edit_t2_var.get()
+        new_t3 = self.lm_edit_t3_var.get()
+        if new_t1 == "—" and new_t2 == "—" and new_t3 == "—":
+            messagebox.showwarning("Nhắc nhở", "Hãy chọn ít nhất 1 tier để sửa (T1, T2, hoặc T3).")
+            return
         ids_to_edit = set()
         for item in selected:
             vals = self.lm_tree.item(item)["values"]
@@ -1389,12 +1601,34 @@ class App(ctk.CTk):
         changed = 0
         for row in self._lm_all_rows:
             if str(row["id"]) in ids_to_edit:
-                row["label"] = new_label
+                if new_t1 != "—":
+                    row["tier1_spam"] = new_t1
+                if new_t2 != "—":
+                    row["tier2_toxic"] = new_t2
+                    # If changing tier2, clear tier3 if incompatible
+                    current_t3 = row.get("tier3_labels", "").split("|") if row.get("tier3_labels") else []
+                    valid_pool = TIER3_TOXIC_LABELS if new_t2 == "Toxic" else TIER3_CLEAN_LABELS
+                    compatible = [lbl for lbl in current_t3 if lbl in valid_pool]
+                    row["tier3_labels"] = "|".join(compatible)
+                if new_t3 != "—":
+                    # Append or replace tier3
+                    current_t3 = row.get("tier3_labels", "").split("|") if row.get("tier3_labels") else []
+                    current_t3 = [lbl for lbl in current_t3 if lbl]
+                    if new_t3 not in current_t3:
+                        current_t3.append(new_t3)
+                    row["tier3_labels"] = "|".join(current_t3)
                 changed += 1
         self._lm_save_data()
         self._lm_display_rows(self._lm_all_rows)
         self._lm_update_chart()
-        self.lm_status_label.configure(text=f"Đã sửa {changed} dòng → '{new_label}'", text_color="green")
+        parts = []
+        if new_t1 != "—":
+            parts.append(f"T1→{new_t1}")
+        if new_t2 != "—":
+            parts.append(f"T2→{new_t2}")
+        if new_t3 != "—":
+            parts.append(f"T3+={new_t3}")
+        self.lm_status_label.configure(text=f"Đã sửa {changed} dòng: {', '.join(parts)}", text_color="green")
 
     def _lm_export_csv(self):
         if not self._lm_all_rows:
@@ -1404,7 +1638,7 @@ class App(ctk.CTk):
         export_path = os.path.join(os.getcwd(), f"labeled_export_{timestamp}.csv")
         try:
             with open(export_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=["id", "text", "label"])
+                writer = csv.DictWriter(f, fieldnames=["id", "text", "tier1_spam", "tier2_toxic", "tier3_labels"])
                 writer.writeheader()
                 writer.writerows(self._lm_all_rows)
             messagebox.showinfo("Thành công", f"Đã xuất {len(self._lm_all_rows)} dòng ra:\n{os.path.basename(export_path)}")
@@ -1413,41 +1647,175 @@ class App(ctk.CTk):
             messagebox.showerror("Lỗi", f"Không thể xuất CSV: {e}")
 
     def _lm_update_chart(self):
-        label_colors = {"Clean": "#22C55E", "Spam": "#F59E0B", "Hate Speech": "#EF4444", "Harassment": "#8B5CF6", "Obscene": "#EC4899"}
-        counts = {lbl: 0 for lbl in label_colors}
+        total = len(self._lm_all_rows)
+
+        # Count tiers
+        t1_counts = {"Spam": 0, "Not Spam": 0}
+        t2_counts = {"Toxic": 0, "Clean": 0}
+        t3_counts = {}
+        for lbl in TIER3_ALL_LABELS:
+            t3_counts[lbl] = 0
+
         for row in self._lm_all_rows:
-            lbl = row.get("label", "Clean")
-            counts[lbl] = counts.get(lbl, 0) + 1
-        total = sum(counts.values())
+            t1 = row.get("tier1_spam", "Not Spam")
+            t2 = row.get("tier2_toxic", "Clean")
+            t1_counts[t1] = t1_counts.get(t1, 0) + 1
+            t2_counts[t2] = t2_counts.get(t2, 0) + 1
+            t3_str = row.get("tier3_labels", "")
+            if t3_str:
+                for lbl in t3_str.split("|"):
+                    lbl = lbl.strip()
+                    if lbl:
+                        t3_counts[lbl] = t3_counts.get(lbl, 0) + 1
+
         if self._lm_canvas:
             self._lm_canvas.get_tk_widget().destroy()
             self._lm_canvas = None
-        fig = Figure(figsize=(4, 4), dpi=100, facecolor="#2B2B2B")
-        ax = fig.add_subplot(111)
-        ax.set_facecolor("#2B2B2B")
-        labels = list(counts.keys())
-        values = list(counts.values())
-        colors = [label_colors.get(lbl, "#6B7280") for lbl in labels]
-        bars = ax.barh(labels, values, color=colors, edgecolor="#444", height=0.6)
-        max_val = max(values) if values and max(values) > 0 else 1
-        for bar, val in zip(bars, values):
-            pct = f"{val / total * 100:.1f}%" if total > 0 else "0%"
-            ax.text(bar.get_width() + max_val * 0.02, bar.get_y() + bar.get_height() / 2,
-                    f"{val}  ({pct})", va="center", ha="left", fontsize=9, color="white", fontweight="bold")
-        ax.set_title(f"Phân Bố Nhãn (n={total})", fontsize=12, color="white", fontweight="bold", pad=10)
-        ax.tick_params(colors="white", labelsize=9)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.spines["bottom"].set_color("#555")
-        ax.spines["left"].set_color("#555")
-        ax.xaxis.label.set_color("white")
+
+        bg_color = "#2B2B2B"
+        fig = Figure(figsize=(5, 6), dpi=90, facecolor=bg_color)
+
+        # --- Tier 1: Pie ---
+        ax1 = fig.add_subplot(3, 1, 1)
+        ax1.set_facecolor(bg_color)
+        t1_labels = list(t1_counts.keys())
+        t1_values = list(t1_counts.values())
+        t1_colors = ["#F59E0B", "#22C55E"]
+        if sum(t1_values) > 0:
+            wedges, texts, autotexts = ax1.pie(
+                t1_values, labels=t1_labels, colors=t1_colors, autopct='%1.0f%%',
+                startangle=90, textprops={"color": "white", "fontsize": 8})
+            for at in autotexts:
+                at.set_fontsize(7)
+        ax1.set_title(f"Tier 1 – Spam Check (n={total})", fontsize=10, color="white", fontweight="bold", pad=5)
+
+        # --- Tier 2: Pie ---
+        ax2 = fig.add_subplot(3, 1, 2)
+        ax2.set_facecolor(bg_color)
+        t2_labels = list(t2_counts.keys())
+        t2_values = list(t2_counts.values())
+        t2_colors = ["#EF4444", "#22C55E"]
+        if sum(t2_values) > 0:
+            wedges2, texts2, autotexts2 = ax2.pie(
+                t2_values, labels=t2_labels, colors=t2_colors, autopct='%1.0f%%',
+                startangle=90, textprops={"color": "white", "fontsize": 8})
+            for at in autotexts2:
+                at.set_fontsize(7)
+        ax2.set_title("Tier 2 – Toxic Check", fontsize=10, color="white", fontweight="bold", pad=5)
+
+        # --- Tier 3: Horizontal bar ---
+        ax3 = fig.add_subplot(3, 1, 3)
+        ax3.set_facecolor(bg_color)
+        t3_color_map = {
+            "Hate Speech": "#EF4444", "Harassment": "#8B5CF6", "Obscene": "#EC4899",
+            "Positive": "#22C55E", "Negative": "#F59E0B", "Neutral": "#6B7280",
+        }
+        t3_labels = list(t3_counts.keys())
+        t3_values = list(t3_counts.values())
+        t3_colors = [t3_color_map.get(lbl, "#6B7280") for lbl in t3_labels]
+        bars = ax3.barh(t3_labels, t3_values, color=t3_colors, edgecolor="#444", height=0.55)
+        max_val = max(t3_values) if t3_values and max(t3_values) > 0 else 1
+        for bar, val in zip(bars, t3_values):
+            if val > 0:
+                ax3.text(bar.get_width() + max_val * 0.02, bar.get_y() + bar.get_height() / 2,
+                         str(val), va="center", ha="left", fontsize=8, color="white", fontweight="bold")
+        ax3.set_title("Tier 3 – Multi-label", fontsize=10, color="white", fontweight="bold", pad=5)
+        ax3.tick_params(colors="white", labelsize=7)
+        ax3.spines["top"].set_visible(False)
+        ax3.spines["right"].set_visible(False)
+        ax3.spines["bottom"].set_color("#555")
+        ax3.spines["left"].set_color("#555")
         if max_val > 0:
-            ax.set_xlim(0, max_val * 1.35)
-        fig.tight_layout()
+            ax3.set_xlim(0, max_val * 1.25)
+
+        fig.tight_layout(pad=1.5)
         self._lm_canvas = FigureCanvasTkAgg(fig, master=self.lm_chart_frame)
         self._lm_canvas.draw()
         self._lm_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         plt.close(fig)
+
+    # ---------------------------------------------------------
+    # LABEL MANAGER: Google Drive Sync
+    # ---------------------------------------------------------
+    def _lm_upload_drive(self):
+        """Upload labeled_data.csv to Google Drive in background thread."""
+        if self._lm_is_processing:
+            messagebox.showwarning("Nhắc nhở", "Đang xử lý, vui lòng đợi...")
+            return
+        if not self._lm_all_rows:
+            messagebox.showwarning("Nhắc nhở", "Chưa có dữ liệu labeled để upload.")
+            return
+
+        self._lm_is_processing = True
+        self.lm_status_label.configure(text="⬆ Đang upload labeled_data.csv lên Google Drive...", text_color="orange")
+
+        def _upload():
+            try:
+                def _log(msg):
+                    self.after(0, lambda: self.lm_status_label.configure(text=msg, text_color="orange"))
+
+                upload_labeled_data(log_callback=_log)
+                self.after(0, lambda: self.lm_status_label.configure(
+                    text=f"✓ Đã upload labeled_data.csv lên Google Drive ({len(self._lm_all_rows)} dòng).",
+                    text_color="green"))
+            except FileNotFoundError as e:
+                self.after(0, lambda: messagebox.showerror("Lỗi", str(e)))
+                self.after(0, lambda: self.lm_status_label.configure(
+                    text="✗ Upload thất bại: thiếu credentials.", text_color="red"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Lỗi Upload", f"Không thể upload lên Drive:\n{str(e)}"))
+                self.after(0, lambda: self.lm_status_label.configure(
+                    text=f"✗ Upload thất bại: {str(e)[:80]}", text_color="red"))
+            finally:
+                self._lm_is_processing = False
+
+        threading.Thread(target=_upload, daemon=True).start()
+
+    def _lm_download_drive(self):
+        """Download labeled_data.csv from Google Drive in background thread."""
+        if self._lm_is_processing:
+            messagebox.showwarning("Nhắc nhở", "Đang xử lý, vui lòng đợi...")
+            return
+
+        if self._lm_all_rows:
+            if not messagebox.askyesno(
+                "Xác nhận",
+                f"Labeled data hiện có {len(self._lm_all_rows)} dòng.\n"
+                "Tải từ Drive sẽ GHI ĐÈ toàn bộ dữ liệu local.\n\n"
+                "Bạn có muốn tiếp tục?"
+            ):
+                return
+
+        self._lm_is_processing = True
+        self.lm_status_label.configure(text="⬇ Đang tải labeled_data.csv từ Google Drive...", text_color="orange")
+
+        def _download():
+            try:
+                def _log(msg):
+                    self.after(0, lambda: self.lm_status_label.configure(text=msg, text_color="orange"))
+
+                success = download_labeled_data(log_callback=_log)
+                if success:
+                    self.after(0, self._lm_load_data)
+                    self.after(0, lambda: self.lm_status_label.configure(
+                        text="✓ Đã tải labeled_data.csv từ Google Drive và cập nhật.",
+                        text_color="green"))
+                else:
+                    self.after(0, lambda: self.lm_status_label.configure(
+                        text="✗ Không tìm thấy labeled_data.csv trên Google Drive.",
+                        text_color="red"))
+            except FileNotFoundError as e:
+                self.after(0, lambda: messagebox.showerror("Lỗi", str(e)))
+                self.after(0, lambda: self.lm_status_label.configure(
+                    text="✗ Download thất bại: thiếu credentials.", text_color="red"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Lỗi Download", f"Không thể tải từ Drive:\n{str(e)}"))
+                self.after(0, lambda: self.lm_status_label.configure(
+                    text=f"✗ Download thất bại: {str(e)[:80]}", text_color="red"))
+            finally:
+                self._lm_is_processing = False
+
+        threading.Thread(target=_download, daemon=True).start()
 
     # ---------------------------------------------------------
     # TAB 4: FILE MANAGER

@@ -222,3 +222,27 @@ def download_warehouse(warehouse_path: str = None, log_callback=None) -> bool:
         )
     return download_file("warehouse.csv", warehouse_path, DRIVE_ROOT_ID,
                          log_callback=log_callback)
+
+
+# =========================================================================== #
+#  Labeled-data convenience functions
+# =========================================================================== #
+
+def upload_labeled_data(labeled_path: str = None, log_callback=None) -> str:
+    """Upload labeled_data.csv to Drive root folder."""
+    if labeled_path is None:
+        labeled_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "labeled_data.csv"
+        )
+    return upload_file(labeled_path, DRIVE_ROOT_ID, log_callback=log_callback)
+
+
+def download_labeled_data(labeled_path: str = None, log_callback=None) -> bool:
+    """Download labeled_data.csv from Drive root folder."""
+    if labeled_path is None:
+        labeled_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "labeled_data.csv"
+        )
+    return download_file("labeled_data.csv", labeled_path, DRIVE_ROOT_ID,
+                         log_callback=log_callback)
+
