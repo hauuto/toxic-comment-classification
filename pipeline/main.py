@@ -661,10 +661,10 @@ class App(ctk.CTk):
             self.kw_log_message("Đang gửi lệnh yêu cầu dừng...")
             self.kw_stop_event.set()
             self.kw_stop_button.configure(state="disabled", text="Đang dừng...")
-            # Also try to kill the browser directly for faster stop
+            # Also try to kill all browsers directly for faster stop
             if self.kw_active_crawler:
                 try:
-                    self.kw_active_crawler.force_kill_driver()
+                    self.kw_active_crawler.close()
                 except Exception:
                     pass
 

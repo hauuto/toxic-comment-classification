@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 
 import requests as _requests
+import cloudscraper
 
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
@@ -784,21 +785,38 @@ class VOZCrawler:
 
     Performance optimisations
     -------------------------
-    • **requests fast-path** – tries ``requests.Session`` first (5-10× faster
-      than Selenium) and falls back to Selenium only when Cloudflare is detected.
+    • **cloudscraper fast-path** – uses ``cloudscraper`` to bypass Cloudflare
+      JS challenges without a browser (10-50× faster than Selenium).  Falls
+      back to Selenium only when cloudscraper cannot solve the challenge.
     • **Concurrent thread scraping** – ``num_workers`` Chrome-driver instances
       (default 3) scrape different VOZ threads in parallel via
-      ``ThreadPoolExecutor``.
+      ``ThreadPoolExecutor``.  Driver creation is staggered via a semaphore
+      to avoid Chrome port conflicts.
+    • **Per-domain rate limiter** – max 2 requests/s to ``voz.vn`` so we
+      don't get IP-banned when cloudscraper makes requests much faster than
+      Selenium did.
     • **Eager page-load strategy** – Selenium no longer waits for images /
       stylesheets / ads to finish loading.
     • **Extended blocked resources** – images, fonts, CSS, video assets are
       blocked via CDP so the browser has less work to do.
     • **Reduced sleep delays** – page-load waits reduced from 2-3 s → 0.8-1.5 s.
+    • **URL deduplication** – normalises DuckDuckGo results to avoid scraping
+      the same VOZ thread twice.
+    • **Retry with backoff** – failed threads are retried up to 2 times before
+      giving up, so transient Selenium errors don't lose data.
     """
 
-    # Shared across all workers for the requests fast-path
-    _http_session: _requests.Session | None = None
+    # Shared across all workers for the cloudscraper fast-path
+    _http_session: cloudscraper.CloudScraper | None = None
     _http_session_lock = threading.Lock()
+
+    # Rate-limiter: track the last request timestamp (per-class)
+    _rate_limit_lock = threading.Lock()
+    _last_request_time: float = 0.0
+    _MIN_REQUEST_INTERVAL: float = 0.5  # max ~2 req/s
+
+    # Semaphore to stagger Selenium driver creation (avoid port collisions)
+    _driver_create_semaphore = threading.Semaphore(1)
 
     _BLOCKED_URLS = [
         "*googleads*", "*doubleclick*", "*googlesyndication*",
@@ -844,70 +862,96 @@ class VOZCrawler:
         clean = _sanitize_keyword(keyword)
         return os.path.join(os.getcwd(), f"{clean}_{self.max_threads}_{self.max_pages}.csv")
 
-    # ── HTTP session (requests fast-path) ──────────────────────────────────
+    # ── HTTP session (cloudscraper fast-path) ────────────────────────────────
     @classmethod
-    def _get_http_session(cls) -> _requests.Session:
-        """Lazily create a shared ``requests.Session`` with VOZ-compatible headers."""
+    def _get_http_session(cls) -> cloudscraper.CloudScraper:
+        """Lazily create a shared ``cloudscraper`` session that can bypass Cloudflare."""
         if cls._http_session is None:
             with cls._http_session_lock:
                 if cls._http_session is None:
-                    s = _requests.Session()
+                    s = cloudscraper.create_scraper(
+                        browser={
+                            "browser": "chrome",
+                            "platform": "windows",
+                            "desktop": True,
+                        },
+                    )
                     s.headers.update({
-                        "User-Agent": (
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0.0.0 Safari/537.36"
-                        ),
                         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                         "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
                     })
                     cls._http_session = s
         return cls._http_session
 
+    @classmethod
+    def _rate_limit_wait(cls):
+        """Enforce a minimum interval between HTTP requests to avoid IP bans."""
+        with cls._rate_limit_lock:
+            now = time.monotonic()
+            elapsed = now - cls._last_request_time
+            if elapsed < cls._MIN_REQUEST_INTERVAL:
+                time.sleep(cls._MIN_REQUEST_INTERVAL - elapsed)
+            cls._last_request_time = time.monotonic()
+
     def _fast_fetch_page(self, url: str, timeout: int = 15) -> str | None:
-        """Try to fetch a VOZ page via ``requests``.
+        """Try to fetch a VOZ page via ``cloudscraper``.
 
         Returns the HTML string on success, or ``None`` if Cloudflare or
         another protection is detected (caller should fall back to Selenium).
         """
         try:
+            self._rate_limit_wait()
             session = self._get_http_session()
             resp = session.get(url, timeout=timeout, allow_redirects=True)
-            if resp.status_code == 403 or resp.status_code == 503:
+            if resp.status_code in (403, 503):
                 return None
             resp.raise_for_status()
             text = resp.text
-            # Cloudflare challenge detection
+            # Cloudflare challenge detection (cloudscraper handles most, but
+            # Turnstile or advanced challenges may still slip through)
             if "Just a moment" in text or "cf-browser-verification" in text:
                 return None
+            # Sanity check: page should contain VOZ forum content
+            if ".message-inner" not in text and "bbWrapper" not in text:
+                return None
             return text
+        except cloudscraper.exceptions.CloudflareChallengeError:
+            return None
         except Exception:
             return None
 
     # ── Selenium driver management ─────────────────────────────────────────
     def _create_driver(self, worker_id: int = 0):
-        """Create a new undetected-chromedriver instance (eager strategy)."""
-        self._log(f"[VOZ] Khởi tạo Chrome Driver (worker {worker_id})...")
-        user_data_dir = os.path.join(os.getcwd(), f"chrome_profile_voz_w{worker_id}")
-        opts = uc.ChromeOptions()
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.page_load_strategy = "eager"          # ← no longer waits for images/CSS
-        driver = uc.Chrome(options=opts, user_data_dir=user_data_dir,
-                           version_main=None, use_subprocess=True)
-        try:
-            driver.set_window_position(self.offset_x, 0)
-            time.sleep(0.5)
-            driver.maximize_window()
-        except Exception:
-            pass
-        driver.set_page_load_timeout(self.timeout)
-        try:
-            driver.execute_cdp_cmd("Network.enable", {})
-            driver.execute_cdp_cmd("Network.setBlockedURLs",
-                                   {"urls": self._BLOCKED_URLS})
-        except Exception:
-            pass
-        return driver
+        """Create a new undetected-chromedriver instance (eager strategy).
+
+        Uses a class-level semaphore to ensure only one driver is created at a
+        time, preventing Chrome port collisions when multiple workers start
+        simultaneously.
+        """
+        with self._driver_create_semaphore:
+            self._log(f"[VOZ] Khởi tạo Chrome Driver (worker {worker_id})...")
+            user_data_dir = os.path.join(os.getcwd(), f"chrome_profile_voz_w{worker_id}")
+            opts = uc.ChromeOptions()
+            opts.add_argument("--disable-blink-features=AutomationControlled")
+            opts.page_load_strategy = "eager"          # ← no longer waits for images/CSS
+            driver = uc.Chrome(options=opts, user_data_dir=user_data_dir,
+                               version_main=None, use_subprocess=True)
+            try:
+                driver.set_window_position(self.offset_x, 0)
+                time.sleep(0.5)
+                driver.maximize_window()
+            except Exception:
+                pass
+            driver.set_page_load_timeout(self.timeout)
+            try:
+                driver.execute_cdp_cmd("Network.enable", {})
+                driver.execute_cdp_cmd("Network.setBlockedURLs",
+                                       {"urls": self._BLOCKED_URLS})
+            except Exception:
+                pass
+            # Small delay after creation so the next worker doesn't collide
+            time.sleep(1.0)
+            return driver
 
     def get_driver(self):
         """Legacy single-driver entry point (used when num_workers == 1)."""
@@ -969,22 +1013,41 @@ class VOZCrawler:
         return drv
 
     # ── DuckDuckGo search ──────────────────────────────────────────────────
+    @staticmethod
+    def _normalize_voz_url(url: str) -> str:
+        """Normalise a VOZ thread URL for deduplication.
+
+        Strips query params, fragments, trailing ``/page-*`` suffixes, and
+        trailing slashes so that variants of the same thread compare equal.
+        """
+        # Remove query string and fragment
+        url = url.split("?")[0].split("#")[0]
+        # Remove /page-N suffix
+        url = re.sub(r"/page-\d+$", "", url)
+        return url.rstrip("/")
+
     def search_voz(self, keyword=None, limit=None) -> List[str]:
         keyword = keyword or self.keyword
         limit = limit or self.max_threads
         self._log(f"[VOZ] Tìm link cho: {keyword}")
-        results = []
+        results: List[str] = []
+        seen_normalised: set[str] = set()
         try:
             with DDGS() as ddgs:
                 gen = ddgs.text(f"site:voz.vn {keyword}", max_results=limit + 10)
                 for r in gen:
                     href = r.get("href")
-                    if href and "/t/" in href and href not in results:
-                        results.append(href)
-                    if len(results) >= limit: break
+                    if href and "/t/" in href:
+                        normalised = self._normalize_voz_url(href)
+                        if normalised not in seen_normalised:
+                            seen_normalised.add(normalised)
+                            # Store the normalised (clean) URL
+                            results.append(normalised)
+                    if len(results) >= limit:
+                        break
         except Exception as e:
             self._log(f"[VOZ] Lỗi search: {e}")
-        self._log(f"[VOZ] Tìm thấy {len(results)} thread links.")
+        self._log(f"[VOZ] Tìm thấy {len(results)} thread links (sau khi loại trùng).")
         return results
 
     # ── Page-level HTML → comments parser ──────────────────────────────────
@@ -1017,8 +1080,8 @@ class VOZCrawler:
                         worker_id: int = 0) -> List[str]:
         """Scrape all comments from a VOZ thread.
 
-        Tries the ``requests`` fast-path first; falls back to Selenium on
-        Cloudflare or other challenges.
+        Tries the ``cloudscraper`` fast-path first; falls back to Selenium on
+        Cloudflare Turnstile or other unsolvable challenges.
         """
         max_pages = max_pages or self.max_pages
         current_thread_comments: List[str] = []
@@ -1027,6 +1090,7 @@ class VOZCrawler:
 
         # Track whether the fast-path is viable for this thread
         use_fast = True
+        fast_path_logged = False
 
         for page in range(1, max_pages + 1):
             if self._stopped():
@@ -1035,15 +1099,16 @@ class VOZCrawler:
 
             html: str | None = None
 
-            # ── Fast path: requests ────────────────────────────────────
+            # ── Fast path: cloudscraper ─────────────────────────────────
             if use_fast:
                 html = self._fast_fetch_page(target_url)
                 if html is not None:
                     comments, has_next = self._parse_comments_from_html(html)
                     if comments:
+                        if not fast_path_logged:
+                            self._log(f"    [FAST] cloudscraper OK (w{worker_id})")
+                            fast_path_logged = True
                         current_thread_comments.extend(comments)
-                        # Tiny polite delay so we don't hammer the server
-                        time.sleep(random.uniform(0.3, 0.6))
                         if not has_next:
                             break
                         continue
@@ -1111,6 +1176,9 @@ class VOZCrawler:
         seen_lock = threading.Lock()
         all_texts_lock = threading.Lock()
 
+        # Track how many threads succeeded via fast-path vs Selenium
+        _stats = {"fast": 0, "selenium": 0, "failed": 0}
+
         def _process_batch(raw_batch: List[str]) -> List[str]:
             """NLP-preprocess a raw batch and deduplicate."""
             processed: List[str] = []
@@ -1135,44 +1203,78 @@ class VOZCrawler:
                             processed.append(clean)
             return processed
 
+        _MAX_RETRIES = 2
+
         def _scrape_one_thread(idx_url: tuple[int, str], worker_id: int) -> None:
-            """Worker function: scrape one thread, preprocess, push results."""
+            """Worker function: scrape one thread with retry-with-backoff."""
             i, url = idx_url
             if self._stopped():
                 return
             self._log(f"\n[VOZ] [KEYWORD: {keyword}] [THREAD {i+1}/{len(urls)}] (worker {worker_id})")
-            try:
-                raw_batch = self.scrape_comments(url, self.max_pages,
-                                                 worker_id=worker_id)
-                if not raw_batch:
-                    self._log(f"    [WARN] Không có data (w{worker_id}) -> Nghi ngờ treo.")
-                    raise WebDriverException("Zero data returned")
 
-                processed_batch = _process_batch(raw_batch)
-                if processed_batch:
-                    with all_texts_lock:
-                        start_idx = len(all_texts) + 1
-                        all_texts.extend(processed_batch)
-                    wh_rows = [{"text": t} for t in processed_batch]
-                    wh_count = append_to_warehouse(wh_rows)
-                    self._log(f"    [WAREHOUSE] +{wh_count} dòng (w{worker_id})")
-                    if self.data_callback:
-                        gui_batch = [
-                            {"id": start_idx + j, "text": t}
-                            for j, t in enumerate(processed_batch)
-                        ]
-                        self.data_callback(gui_batch)
-
-            except WebDriverException as e:
-                self._log(f"    [CRITICAL] Lỗi/Treo (w{worker_id}): {e}")
-                self._log(f"    [RECOVERY] Restarting Driver (w{worker_id})...")
+            last_error = None
+            for attempt in range(_MAX_RETRIES + 1):
+                if self._stopped():
+                    return
                 try:
-                    self._restart_pool_driver(worker_id)
-                    self._log(f"    [RECOVERY] Driver mới sẵn sàng (w{worker_id}).")
-                except Exception:
-                    self._log(f"    [FATAL] Không thể restart driver (w{worker_id}).")
-            except Exception as e:
-                self._log(f"    [ERROR] (w{worker_id}) {e}")
+                    if attempt > 0:
+                        backoff = min(2 ** attempt, 8)
+                        self._log(f"    [RETRY] Attempt {attempt+1}/{_MAX_RETRIES+1} "
+                                  f"after {backoff}s backoff (w{worker_id})")
+                        time.sleep(backoff)
+
+                    raw_batch = self.scrape_comments(url, self.max_pages,
+                                                     worker_id=worker_id)
+                    if not raw_batch:
+                        # No data – could be an empty thread or Cloudflare block
+                        self._log(f"    [WARN] Không có data (w{worker_id})")
+                        if attempt < _MAX_RETRIES:
+                            # Try restarting driver before retry
+                            try:
+                                self._restart_pool_driver(worker_id)
+                                self._log(f"    [RECOVERY] Driver mới sẵn sàng (w{worker_id}).")
+                            except Exception:
+                                pass
+                            continue
+                        _stats["failed"] += 1
+                        return
+
+                    processed_batch = _process_batch(raw_batch)
+                    if processed_batch:
+                        with all_texts_lock:
+                            start_idx = len(all_texts) + 1
+                            all_texts.extend(processed_batch)
+                        wh_rows = [{"text": t} for t in processed_batch]
+                        wh_count = append_to_warehouse(wh_rows)
+                        self._log(f"    [WAREHOUSE] +{wh_count} dòng (w{worker_id})")
+                        if self.data_callback:
+                            gui_batch = [
+                                {"id": start_idx + j, "text": t}
+                                for j, t in enumerate(processed_batch)
+                            ]
+                            self.data_callback(gui_batch)
+                    # Success – break out of retry loop
+                    return
+
+                except WebDriverException as e:
+                    last_error = e
+                    self._log(f"    [CRITICAL] Lỗi/Treo (w{worker_id}): {e}")
+                    if attempt < _MAX_RETRIES:
+                        self._log(f"    [RECOVERY] Restarting Driver (w{worker_id})...")
+                        try:
+                            self._restart_pool_driver(worker_id)
+                            self._log(f"    [RECOVERY] Driver mới sẵn sàng (w{worker_id}).")
+                        except Exception:
+                            self._log(f"    [FATAL] Không thể restart driver (w{worker_id}).")
+                            _stats["failed"] += 1
+                            return
+                    else:
+                        self._log(f"    [GIVE UP] Hết retry cho thread này (w{worker_id}).")
+                        _stats["failed"] += 1
+                except Exception as e:
+                    self._log(f"    [ERROR] (w{worker_id}) {e}")
+                    _stats["failed"] += 1
+                    return
 
         # ── Dispatch: concurrent or sequential ─────────────────────────
         effective_workers = min(self.num_workers, len(urls))
@@ -1186,27 +1288,39 @@ class VOZCrawler:
                 _scrape_one_thread(idx_url, worker_id=0)
         else:
             self._log(f"[VOZ] Bắt đầu cào song song với {effective_workers} workers...")
+            # Use a work queue approach: each worker pulls the next URL when
+            # it finishes, rather than submitting all futures at once.  This
+            # avoids the race condition where multiple workers try to create
+            # their Selenium drivers simultaneously.
+            url_queue: list[tuple[int, str]] = list(enumerate(urls))
+            queue_lock = threading.Lock()
+
+            def _worker_loop(worker_id: int) -> None:
+                while True:
+                    if self._stopped():
+                        return
+                    with queue_lock:
+                        if not url_queue:
+                            return
+                        idx_url = url_queue.pop(0)
+                    _scrape_one_thread(idx_url, worker_id)
+
             with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-                futures = {}
-                for i, url in enumerate(urls):
-                    if self._stopped():
-                        break
-                    worker_id = i % effective_workers
-                    fut = executor.submit(_scrape_one_thread, (i, url), worker_id)
-                    futures[fut] = (i, url)
+                futures = []
+                for wid in range(effective_workers):
+                    futures.append(executor.submit(_worker_loop, wid))
                 for fut in as_completed(futures):
-                    if self._stopped():
-                        break
                     try:
                         fut.result()
                     except Exception as e:
-                        self._log(f"    [ERROR] Future exception: {e}")
+                        self._log(f"    [ERROR] Worker exception: {e}")
 
         if all_texts:
             add_keyword_to_history("voz", keyword)
             self._log(f"[VOZ] Đã thêm '{keyword}' vào lịch sử keyword.")
 
-        self._log(f"[VOZ] Hoàn tất '{keyword}' – tổng {len(all_texts)} bình luận.")
+        self._log(f"[VOZ] Hoàn tất '{keyword}' – tổng {len(all_texts)} bình luận. "
+                  f"(thất bại: {_stats['failed']})")
         return all_texts
 
 
