@@ -14,6 +14,13 @@ import unicodedata
 # IPv4 address pattern — matches e.g. 192.168.1.1
 _IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
+# --- Threads-specific artifact patterns (safety net for NLP pipeline) ---
+# Trailing "Translate" / "Dịch" button text stuck to comment
+_TRAILING_TRANSLATE = re.compile(r"(?:[Tt]ranslate|Dịch)\s*$")
+# "gia đình" repeated anomaly from emoji <img alt="gia đình"> leak
+_GIA_DINH_SPAM = re.compile(r"(?:\s*gia đình\s*){2,}:?")
+_GIA_DINH_NEAR_EMOJI = re.compile(r"\s*gia đình\s*:?\s*(?=:|$)")
+
 
 class Decoder:
     """Decode raw Vietnamese social media comments."""
@@ -177,6 +184,17 @@ class Decoder:
         """Replace IPv4 addresses with <IP> token."""
         return _IP_PATTERN.sub("<IP>", text)
 
+    def clean_threads_artifacts(self, text: str) -> str:
+        """Remove Threads-specific scraping artifacts (trailing Translate, gia đình spam).
+
+        This is a safety net: even if the crawler didn't strip these, the NLP
+        pipeline will catch them here before filtering/normalizing.
+        """
+        text = _TRAILING_TRANSLATE.sub("", text)
+        text = _GIA_DINH_SPAM.sub(" ", text)
+        text = _GIA_DINH_NEAR_EMOJI.sub(" ", text)
+        return text.strip()
+
     def decode(self, text: str) -> str:
         """Run full decode pipeline on a comment."""
         # NFC normalization first: handles decomposed Unicode from copy-paste/editors
@@ -186,4 +204,5 @@ class Decoder:
         text = self.replace_ip(text)          # IPv4 → <IP>
         text = self.decode_emoji(text)
         text = self.decode_icons(text)
+        text = self.clean_threads_artifacts(text)
         return text
