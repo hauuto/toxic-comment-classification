@@ -8,12 +8,13 @@ import threading
 import customtkinter as ctk
 from tkinter import messagebox, ttk
 
-from crawler import extract_comments_stream, VOZCrawler, ThreadsCrawler, load_keyword_history
+from crawler import extract_comments_stream, VOZCrawler, ThreadsCrawler, GoogleMapsCrawler, load_keyword_history
 from nlp_pipeline.warehouse import append_to_warehouse, get_warehouse_count, read_warehouse, overwrite_warehouse
 from nlp_pipeline import VietnameseCommentPreprocessor
 from google_drive import upload_warehouse, download_warehouse, upload_labeled_data, download_labeled_data
 from lmstudio_classifier import (LMStudioClassifier, TIER1_LABELS, TIER2_LABELS,
                                   TIER3_TOXIC_LABELS, TIER3_CLEAN_LABELS, TIER3_ALL_LABELS)
+from gemini_hierarchical_classifier import GeminiHierarchicalClassifier
 from nlp_pipeline.word_segmentor import WordSegmentor
 from google_drive import upload_warehouse, download_warehouse
 from lmstudio_classifier import LMStudioClassifier
@@ -281,7 +282,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(input_frame, text="Platform:").grid(row=0, column=2, padx=(10, 5), pady=10)
         self.kw_platform_var = ctk.StringVar(value="VOZ")
         self.kw_platform_menu = ctk.CTkOptionMenu(
-            input_frame, values=["VOZ", "Threads"],
+            input_frame, values=["VOZ", "Threads", "Google Maps"],
             variable=self.kw_platform_var, command=self._on_kw_platform_change, width=120
         )
         self.kw_platform_menu.grid(row=0, column=3, padx=(0, 10), pady=10)
@@ -307,6 +308,27 @@ class App(ctk.CTk):
         ctk.CTkLabel(self.kw_threads_frame, text="Max Scroll:").pack(side="left", padx=(0, 5))
         self.kw_max_scroll_var = ctk.StringVar(value="30")
         ctk.CTkEntry(self.kw_threads_frame, textvariable=self.kw_max_scroll_var, width=60).pack(side="left", padx=(0, 15))
+
+        # Google Maps params
+        self.kw_maps_frame = ctk.CTkFrame(param_frame, fg_color="transparent")
+        ctk.CTkLabel(self.kw_maps_frame, text="Center Lat:").pack(side="left", padx=(0, 5))
+        self.kw_maps_lat_var = ctk.StringVar(value="")
+        ctk.CTkEntry(self.kw_maps_frame, textvariable=self.kw_maps_lat_var, width=90).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(self.kw_maps_frame, text="Center Lng:").pack(side="left", padx=(0, 5))
+        self.kw_maps_lng_var = ctk.StringVar(value="")
+        ctk.CTkEntry(self.kw_maps_frame, textvariable=self.kw_maps_lng_var, width=90).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(self.kw_maps_frame, text="Radius(m):").pack(side="left", padx=(0, 5))
+        self.kw_maps_radius_var = ctk.StringVar(value="3000")
+        ctk.CTkEntry(self.kw_maps_frame, textvariable=self.kw_maps_radius_var, width=70).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(self.kw_maps_frame, text="Step(m):").pack(side="left", padx=(0, 5))
+        self.kw_maps_step_var = ctk.StringVar(value="1500")
+        ctk.CTkEntry(self.kw_maps_frame, textvariable=self.kw_maps_step_var, width=70).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(self.kw_maps_frame, text="Max Places:").pack(side="left", padx=(0, 5))
+        self.kw_maps_max_places_var = ctk.StringVar(value="200")
+        ctk.CTkEntry(self.kw_maps_frame, textvariable=self.kw_maps_max_places_var, width=70).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(self.kw_maps_frame, text="Max Reviews/Place:").pack(side="left", padx=(0, 5))
+        self.kw_maps_max_reviews_var = ctk.StringVar(value="5")
+        ctk.CTkEntry(self.kw_maps_frame, textvariable=self.kw_maps_max_reviews_var, width=60).pack(side="left", padx=(0, 10))
 
         # Show VOZ params by default
         self.kw_voz_frame.pack(side="left")
@@ -418,19 +440,33 @@ class App(ctk.CTk):
         self.refresh_keyword_history()
 
     def _on_kw_platform_change(self, platform):
-        if platform == "VOZ":
-            self.kw_threads_frame.pack_forget()
-            self.kw_voz_frame.pack(side="left")
-        else:
+        # Hide all param frames then show selected
+        try:
             self.kw_voz_frame.pack_forget()
+        except Exception:
+            pass
+        try:
+            self.kw_threads_frame.pack_forget()
+        except Exception:
+            pass
+        try:
+            self.kw_maps_frame.pack_forget()
+        except Exception:
+            pass
+
+        if platform == "VOZ":
+            self.kw_voz_frame.pack(side="left")
+        elif platform == "Threads":
             self.kw_threads_frame.pack(side="left")
+        else:
+            self.kw_maps_frame.pack(side="left")
 
     def refresh_keyword_history(self):
         for item in self.kw_history_tree.get_children():
             self.kw_history_tree.delete(item)
         try:
             history = load_keyword_history()
-            for platform in ["voz", "threads"]:
+            for platform in ["voz", "threads", "google_maps"]:
                 for kw in history.get(platform, []):
                     self.kw_history_tree.insert("", "end", values=(platform.upper(), kw))
         except Exception:
@@ -509,6 +545,12 @@ class App(ctk.CTk):
         max_pages,
         max_posts,
         max_scroll,
+        maps_lat="",
+        maps_lng="",
+        maps_radius="3000",
+        maps_step="1500",
+        maps_max_places="200",
+        maps_max_reviews="5",
     ):
         crawler = None
         try:
@@ -544,11 +586,29 @@ class App(ctk.CTk):
                         use_normalizer=u_nor,
                         use_segmentor=use_segmentor,
                     )
-                else:
+                elif platform == "Threads":
                     crawler = ThreadsCrawler(
                         keyword=keyword,
                         max_posts=max_posts,
                         max_scroll=max_scroll,
+                        log_callback=log_cb,
+                        stop_event=self.kw_stop_event,
+                        data_callback=self.kw_handle_new_data,
+                        preprocessor=preprocessor,
+                        use_decoder=u_dec,
+                        use_filter=u_fil,
+                        use_normalizer=u_nor,
+                        use_segmentor=use_segmentor,
+                    )
+                else:
+                    crawler = GoogleMapsCrawler(
+                        keyword=keyword,
+                        center_lat=float(maps_lat),
+                        center_lng=float(maps_lng),
+                        radius_m=int(maps_radius),
+                        grid_step_m=int(maps_step),
+                        max_places=int(maps_max_places),
+                        max_reviews_per_place=int(maps_max_reviews),
                         log_callback=log_cb,
                         stop_event=self.kw_stop_event,
                         data_callback=self.kw_handle_new_data,
@@ -619,6 +679,31 @@ class App(ctk.CTk):
         max_posts = int(self.kw_max_posts_var.get() or 10)
         max_scroll = int(self.kw_max_scroll_var.get() or 30)
 
+        # Google Maps params (used only when platform == "Google Maps")
+        maps_lat = self.kw_maps_lat_var.get().strip() if hasattr(self, "kw_maps_lat_var") else ""
+        maps_lng = self.kw_maps_lng_var.get().strip() if hasattr(self, "kw_maps_lng_var") else ""
+        maps_radius = self.kw_maps_radius_var.get().strip() if hasattr(self, "kw_maps_radius_var") else "3000"
+        maps_step = self.kw_maps_step_var.get().strip() if hasattr(self, "kw_maps_step_var") else "1500"
+        maps_max_places = self.kw_maps_max_places_var.get().strip() if hasattr(self, "kw_maps_max_places_var") else "200"
+        maps_max_reviews = self.kw_maps_max_reviews_var.get().strip() if hasattr(self, "kw_maps_max_reviews_var") else "5"
+
+        if platform == "Google Maps":
+            if not maps_lat or not maps_lng:
+                messagebox.showwarning("Lỗi", "Vui lòng nhập Center Lat/Lng cho Google Maps!")
+                self._set_kw_gui_state(False)
+                return
+            try:
+                float(maps_lat)
+                float(maps_lng)
+                int(maps_radius)
+                int(maps_step)
+                int(maps_max_places)
+                int(maps_max_reviews)
+            except ValueError:
+                messagebox.showwarning("Lỗi", "Google Maps params không hợp lệ (Lat/Lng là số thực, còn lại là số nguyên).")
+                self._set_kw_gui_state(False)
+                return
+
         self.kw_extracted_data = []
         self.kw_tree_data.delete(*self.kw_tree_data.get_children())
         self.kw_log_textbox.configure(state="normal")
@@ -635,7 +720,8 @@ class App(ctk.CTk):
         thread = threading.Thread(
             target=self._keyword_crawl_thread,
             args=(keywords, platform, u_dec, u_fil, u_nor, use_segmentor, preprocessor,
-                  max_threads, max_pages, max_posts, max_scroll),
+                  max_threads, max_pages, max_posts, max_scroll,
+                  maps_lat, maps_lng, maps_radius, maps_step, maps_max_places, maps_max_reviews),
             daemon=True,
         )
         thread.start()
@@ -1067,7 +1153,7 @@ class App(ctk.CTk):
 
         self.lbl_log_textbox = ctk.CTkTextbox(work_frame, corner_radius=5)
         self.lbl_log_textbox.grid(row=0, column=0, padx=(5, 5), pady=5, sticky="nsew")
-        self.lbl_log_textbox.insert("0.0", "Sẵn sàng. Hãy kiểm tra kết nối LM Studio trước khi bắt đầu.\n")
+        self.lbl_log_textbox.insert("0.0", "Sẵn sàng. (Gemini: set GEMINI_API_KEY trong .env)\n")
         self.lbl_log_textbox.configure(state="disabled")
 
         table_frame = ctk.CTkFrame(work_frame, fg_color="transparent")
@@ -1105,36 +1191,59 @@ class App(ctk.CTk):
         self.lbl_log_textbox.configure(state="disabled")
 
     def _lbl_test_connection(self):
+        gemini_enabled = bool(os.getenv("GEMINI_API_KEY", "").strip())
         base_url = self.lbl_endpoint_var.get().strip()
-        if not base_url:
-            messagebox.showwarning("Lỗi", "Vui lòng nhập endpoint!")
-            return
-        self._lbl_log(f"🔌 Đang kiểm tra kết nối tới {base_url} ...")
+        model_name = self.lbl_model_var.get().strip()
+        if gemini_enabled:
+            effective_model = model_name or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+            self._lbl_log(f"🔌 Đang kiểm tra Gemini API (model={effective_model}) ...")
+        else:
+            if not base_url:
+                messagebox.showwarning("Lỗi", "Vui lòng nhập endpoint!")
+                return
+            self._lbl_log(f"🔌 Đang kiểm tra kết nối tới {base_url} ...")
+
         self.lbl_test_btn.configure(state="disabled", text="Đang kiểm tra...")
 
         def _test():
-            result = LMStudioClassifier.test_connection(base_url)
-            if result["ok"]:
-                models_str = ", ".join(result["models"]) if result["models"] else "(không có model nào)"
-                self.after(0, self._lbl_log, f"✅ Kết nối thành công! Models: {models_str}")
-                self.after(0, lambda: self.lbl_status_label.configure(
-                    text=f"✅ LM Studio đang chạy — {len(result['models'])} model(s)", text_color="green"))
-                if len(result["models"]) == 1:
-                    self.after(0, lambda: self.lbl_model_var.set(result["models"][0]))
+            if gemini_enabled:
+                result = GeminiHierarchicalClassifier.test_connection(model=model_name)
+                if result["ok"]:
+                    models_str = ", ".join(result["models"]) if result["models"] else "(unknown model)"
+                    self.after(0, self._lbl_log, f"✅ Gemini OK! Model: {models_str}")
+                    self.after(0, lambda: self.lbl_status_label.configure(
+                        text="✅ Gemini API sẵn sàng", text_color="green"))
+                    if result.get("models") and not model_name:
+                        self.after(0, lambda: self.lbl_model_var.set(result["models"][0]))
+                else:
+                    self.after(0, self._lbl_log, f"❌ Lỗi Gemini: {result['error']}")
+                    self.after(0, lambda: self.lbl_status_label.configure(
+                        text="❌ Không thể kết nối Gemini", text_color="red"))
             else:
-                self.after(0, self._lbl_log, f"❌ Lỗi: {result['error']}")
-                self.after(0, lambda: self.lbl_status_label.configure(
-                    text="❌ Không thể kết nối LM Studio", text_color="red"))
+                result = LMStudioClassifier.test_connection(base_url)
+                if result["ok"]:
+                    models_str = ", ".join(result["models"]) if result["models"] else "(không có model nào)"
+                    self.after(0, self._lbl_log, f"✅ Kết nối thành công! Models: {models_str}")
+                    self.after(0, lambda: self.lbl_status_label.configure(
+                        text=f"✅ LM Studio đang chạy — {len(result['models'])} model(s)", text_color="green"))
+                    if len(result["models"]) == 1:
+                        self.after(0, lambda: self.lbl_model_var.set(result["models"][0]))
+                else:
+                    self.after(0, self._lbl_log, f"❌ Lỗi: {result['error']}")
+                    self.after(0, lambda: self.lbl_status_label.configure(
+                        text="❌ Không thể kết nối LM Studio", text_color="red"))
             self.after(0, lambda: self.lbl_test_btn.configure(state="normal", text="🔌 Test Connection"))
         threading.Thread(target=_test, daemon=True).start()
 
     def _lbl_start_labeling(self):
         if self._lbl_is_running:
             return
+        gemini_enabled = bool(os.getenv("GEMINI_API_KEY", "").strip())
         base_url = self.lbl_endpoint_var.get().strip()
-        if not base_url:
-            messagebox.showwarning("Lỗi", "Vui lòng nhập endpoint!")
-            return
+        if not gemini_enabled:
+            if not base_url:
+                messagebox.showwarning("Lỗi", "Vui lòng nhập endpoint!")
+                return
         rows = read_warehouse()
         if not rows:
             messagebox.showwarning("Lỗi", "Warehouse trống! Hãy crawl dữ liệu trước.")
@@ -1144,6 +1253,7 @@ class App(ctk.CTk):
         except ValueError:
             batch_size = 5
         model_name = self.lbl_model_var.get().strip()
+        effective_model = model_name or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
         self.lbl_tree.delete(*self.lbl_tree.get_children())
         self.lbl_log_textbox.configure(state="normal")
@@ -1160,16 +1270,25 @@ class App(ctk.CTk):
         self.lbl_endpoint_entry.configure(state="disabled")
         self.lbl_model_entry.configure(state="disabled")
 
-        endpoint = f"{base_url.rstrip('/')}/v1/chat/completions"
         self._lbl_log(f"🚀 Bắt đầu gán nhãn {len(rows)} bình luận")
-        self._lbl_log(f"   Endpoint: {endpoint}")
-        self._lbl_log(f"   Model: {model_name or '(auto)'}")
+        if gemini_enabled:
+            self._lbl_log("   Provider: Gemini (Google AI Studio)")
+            self._lbl_log(f"   Model: {effective_model}")
+        else:
+            endpoint = f"{base_url.rstrip('/')}/v1/chat/completions"
+            self._lbl_log("   Provider: LM Studio")
+            self._lbl_log(f"   Endpoint: {endpoint}")
+            self._lbl_log(f"   Model: {model_name or '(auto)'}")
         self._lbl_log(f"   Batch size: {batch_size}")
         self._lbl_log("=" * 50)
 
         def _labeling_thread():
             import pandas as pd
-            classifier = LMStudioClassifier(endpoint=endpoint, model=model_name, timeout=120)
+            if gemini_enabled:
+                classifier = GeminiHierarchicalClassifier(model=effective_model, timeout=120)
+            else:
+                endpoint = f"{base_url.rstrip('/')}/v1/chat/completions"
+                classifier = LMStudioClassifier(endpoint=endpoint, model=model_name, timeout=120)
             labeled_path = self._get_labeled_data_path()
 
             # --- Load existing labeled data for resume support ---

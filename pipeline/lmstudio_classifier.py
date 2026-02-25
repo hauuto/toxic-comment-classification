@@ -68,6 +68,15 @@ Example for 2 comments:
   {"tier1_spam": "Not Spam", "tier2_toxic": "Toxic", "tier3_labels": ["Obscene", "Harassment"]},
   {"tier1_spam": "Spam", "tier2_toxic": "Clean", "tier3_labels": ["Neutral"]}
 ]
+### Rules & Notes
+General Rules:
+- Evaluate tiers independently but logically consistent.
+- If Tier 2 = "Toxic", Tier 3 MUST contain at least one toxic label.
+- If Tier 2 = "Clean", Tier 3 MUST contain at least one clean label.
+- Toxic classification overrides sentiment classification.
+- Do not classify something as Spam based only on being short.
+- Criticism without insult = Clean + Negative.
+- Profanity automatically qualifies as Obscene (Toxic).
 
 Do NOT add any explanation, numbering, or extra text outside the JSON array."""
 
