@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import threading
+import concurrent.futures
 from typing import Any, Dict, List
 
 import pandas as pd
@@ -57,6 +59,7 @@ def main() -> None:
     parser.add_argument("--output", default=os.path.join("pipeline", "labeled_data.csv"))
     parser.add_argument("--model", default="", help="Gemini model name (default from GEMINI_MODEL or gemini-2.0-flash)")
     parser.add_argument("--batch-size", type=int, default=5, help="Batch size (default: 5, max: 20)")
+    parser.add_argument("--workers", type=int, default=1, help="Số luồng gửi request song song (default: 1)")
     parser.add_argument("--timeout", type=int, default=120, help="Request timeout in seconds")
     parser.add_argument("--resume", action="store_true", help="Skip rows already in output (by id)")
     parser.add_argument("--dry-run", action="store_true")
@@ -70,6 +73,7 @@ def main() -> None:
     df = pd.read_csv(args.input)
 
     batch_size = max(1, min(int(args.batch_size), 20))
+    workers = max(1, min(int(args.workers), 32))
     model = (args.model or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")).strip() or "gemini-2.0-flash"
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
@@ -79,7 +83,12 @@ def main() -> None:
     if args.resume:
         labeled_ids = _load_existing_ids(args.output)
 
-    classifier = None if args.dry_run else GeminiHierarchicalClassifier(model=model, timeout=args.timeout)
+    # For multi-threading, keep one classifier per worker thread (requests.Session is not guaranteed thread-safe).
+    def _make_classifier() -> GeminiHierarchicalClassifier:
+        return GeminiHierarchicalClassifier(model=model, timeout=args.timeout)
+
+    classifier_single = None if args.dry_run else _make_classifier()
+    request_retries = 3
 
     label_counts: dict[str, int] = {}
     processed = 0
@@ -97,27 +106,23 @@ def main() -> None:
     print("🚀 BẮT ĐẦU PHÂN LOẠI (GEMINI - 3 TIER)")
     print(f"   - Model: {model}")
     print(f"   - Batch size: {batch_size}")
+    print(f"   - Workers: {workers}")
     print(f"   - Resume: {'ON' if args.resume else 'OFF'}")
     print("   - Ctrl + C để dừng an toàn")
     print("=" * 60)
 
     pbar = tqdm(total=total_pending, desc="Đang xử lý", unit=" dòng")
 
-    def flush_batch() -> None:
+    def _default_result() -> Dict[str, Any]:
+        return {"tier1_spam": "Not Spam", "tier2_toxic": "Clean", "tier3_labels": ["Neutral"]}
+
+    def _write_batch(batch_rows: List[Dict[str, Any]], preds: List[Dict[str, Any]]) -> None:
         nonlocal processed, file_exists
-
-        if args.dry_run:
-            preds = [
-                {"tier1_spam": "Not Spam", "tier2_toxic": "Clean", "tier3_labels": ["Neutral"]}
-                for _ in buffer_tasks
-            ]
-        else:
-            preds = classifier.predict(buffer_tasks)
-
         rows_to_write = []
-        for row_i, pred in zip(buffer_rows, preds):
-            t1 = pred["tier1_spam"]
-            t2 = pred["tier2_toxic"]
+
+        for row_i, pred in zip(batch_rows, preds):
+            t1 = pred.get("tier1_spam", "Not Spam")
+            t2 = pred.get("tier2_toxic", "Clean")
             t3_list = pred.get("tier3_labels", []) or []
             t3 = "|".join(t3_list)
 
@@ -141,38 +146,117 @@ def main() -> None:
             if processed % POSTFIX_EVERY == 0:
                 pbar.set_postfix(label_counts)
 
-        pd.DataFrame(rows_to_write).to_csv(
-            args.output,
-            mode="a",
-            header=not file_exists,
-            index=False,
-            encoding="utf-8-sig",
-        )
-        file_exists = True
+        if rows_to_write:
+            pd.DataFrame(rows_to_write).to_csv(
+                args.output,
+                mode="a",
+                header=not file_exists,
+                index=False,
+                encoding="utf-8-sig",
+            )
+            file_exists = True
+
+    _thread_local = threading.local()
+
+    def _predict_batch(batch_tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if args.dry_run:
+            return [_default_result() for _ in batch_tasks]
+
+        if workers <= 1:
+            preds = classifier_single.predict(batch_tasks, retries=request_retries)
+            if not isinstance(preds, list) or len(preds) != len(batch_tasks):
+                return [_default_result() for _ in batch_tasks]
+            return preds
+
+        clf = getattr(_thread_local, "classifier", None)
+        if clf is None:
+            clf = _make_classifier()
+            _thread_local.classifier = clf
+
+        preds = clf.predict(batch_tasks, retries=request_retries)
+        if not isinstance(preds, list) or len(preds) != len(batch_tasks):
+            return [_default_result() for _ in batch_tasks]
+        return preds
 
     try:
-        for _, row in df.iterrows():
-            rid = row.get(args.id_col, 0)
+        if workers <= 1:
+            for _, row in df.iterrows():
+                rid = row.get(args.id_col, 0)
+                try:
+                    rid_int = int(rid)
+                except Exception:
+                    rid_int = 0
+
+                if args.resume and rid_int in labeled_ids:
+                    continue
+
+                buffer_rows.append(row)
+                buffer_tasks.append({"data": {"text": str(row[args.text_col])}})
+
+                if len(buffer_tasks) < batch_size:
+                    continue
+
+                preds = _predict_batch(buffer_tasks)
+                _write_batch(buffer_rows, preds)
+                buffer_rows.clear()
+                buffer_tasks.clear()
+
+            if buffer_tasks:
+                preds = _predict_batch(buffer_tasks)
+                _write_batch(buffer_rows, preds)
+        else:
+            max_inflight = max(1, workers * 2)
+            inflight: dict[int, tuple[concurrent.futures.Future, List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
+            next_batch_to_write = 0
+            batch_index = 0
+
+            ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
             try:
-                rid_int = int(rid)
-            except Exception:
-                rid_int = 0
+                for _, row in df.iterrows():
+                    rid = row.get(args.id_col, 0)
+                    try:
+                        rid_int = int(rid)
+                    except Exception:
+                        rid_int = 0
 
-            if args.resume and rid_int in labeled_ids:
-                continue
+                    if args.resume and rid_int in labeled_ids:
+                        continue
 
-            buffer_rows.append(row)
-            buffer_tasks.append({"data": {"text": str(row[args.text_col])}})
+                    buffer_rows.append(row)
+                    buffer_tasks.append({"data": {"text": str(row[args.text_col])}})
 
-            if len(buffer_tasks) < batch_size:
-                continue
+                    if len(buffer_tasks) < batch_size:
+                        continue
 
-            flush_batch()
-            buffer_rows.clear()
-            buffer_tasks.clear()
+                    batch_rows = buffer_rows
+                    batch_tasks = buffer_tasks
+                    buffer_rows = []
+                    buffer_tasks = []
 
-        if buffer_tasks:
-            flush_batch()
+                    fut = ex.submit(_predict_batch, batch_tasks)
+                    inflight[batch_index] = (fut, batch_rows, batch_tasks)
+                    batch_index += 1
+
+                    while len(inflight) >= max_inflight and next_batch_to_write in inflight:
+                        f, rws, tks = inflight.pop(next_batch_to_write)
+                        preds = f.result()
+                        _write_batch(rws, preds)
+                        next_batch_to_write += 1
+
+                if buffer_tasks:
+                    fut = ex.submit(_predict_batch, buffer_tasks)
+                    inflight[batch_index] = (fut, buffer_rows, buffer_tasks)
+                    batch_index += 1
+                    buffer_rows = []
+                    buffer_tasks = []
+
+                while next_batch_to_write in inflight:
+                    f, rws, tks = inflight.pop(next_batch_to_write)
+                    preds = f.result()
+                    _write_batch(rws, preds)
+                    next_batch_to_write += 1
+            finally:
+                ex.shutdown(wait=True, cancel_futures=True)
 
     except KeyboardInterrupt:
         tqdm.write("\n🛑 Ctrl + C — dừng an toàn, dữ liệu đã được lưu.")

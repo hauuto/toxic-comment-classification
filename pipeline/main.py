@@ -5,6 +5,7 @@ import time
 import json
 import re
 import threading
+import concurrent.futures
 from datetime import datetime, timezone
 import customtkinter as ctk
 from tkinter import messagebox, ttk
@@ -1059,6 +1060,10 @@ class App(ctk.CTk):
         self.lbl_batch_var = ctk.StringVar(value="5")
         ctk.CTkEntry(ctrl_frame, textvariable=self.lbl_batch_var, width=60).pack(side="left", padx=(0, 15))
 
+        ctk.CTkLabel(ctrl_frame, text="Workers:").pack(side="left", padx=(5, 5))
+        self.lbl_workers_var = ctk.StringVar(value="4")
+        ctk.CTkEntry(ctrl_frame, textvariable=self.lbl_workers_var, width=60).pack(side="left", padx=(0, 15))
+
         # Cluster selector (25k rows per cluster)
         ctk.CTkLabel(ctrl_frame, text="Cluster:").pack(side="left", padx=(5, 5))
         self.lbl_cluster_var = ctk.StringVar(value="")
@@ -1311,6 +1316,13 @@ class App(ctk.CTk):
             batch_size = max(1, min(int(self.lbl_batch_var.get()), 20))
         except ValueError:
             batch_size = 5
+
+        try:
+            workers = int((self.lbl_workers_var.get() or "").strip() or "1")
+        except Exception:
+            workers = 1
+        workers = max(1, min(workers, 32))
+        request_retries = 3 if gemini_enabled else 1
         model_name = self.lbl_model_var.get().strip()
         effective_model = model_name or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
@@ -1343,15 +1355,23 @@ class App(ctk.CTk):
             self._lbl_log(f"   Endpoint: {endpoint}")
             self._lbl_log(f"   Model: {model_name or '(auto)'}")
         self._lbl_log(f"   Batch size: {batch_size}")
+        self._lbl_log(f"   Workers: {workers}")
         self._lbl_log("=" * 50)
 
         def _labeling_thread():
             import pandas as pd
-            if gemini_enabled:
-                classifier = GeminiHierarchicalClassifier(model=effective_model, timeout=120)
-            else:
-                endpoint = f"{base_url.rstrip('/')}/v1/chat/completions"
-                classifier = LMStudioClassifier(endpoint=endpoint, model=model_name, timeout=120)
+            # NOTE: For multi-threading, each worker thread will keep its own classifier instance
+            # (requests.Session is not guaranteed thread-safe).
+            endpoint = f"{base_url.rstrip('/')}/v1/chat/completions"
+
+            def _make_classifier():
+                if gemini_enabled:
+                    return GeminiHierarchicalClassifier(model=effective_model, timeout=120)
+                return LMStudioClassifier(endpoint=endpoint, model=model_name, timeout=120)
+
+            classifier_single = None
+            if workers <= 1:
+                classifier_single = _make_classifier()
             labeled_path = self._get_labeled_data_path()
 
             # --- Load existing labeled data for resume support ---
@@ -1447,21 +1467,27 @@ class App(ctk.CTk):
 
             self.after(0, self._lbl_log, f"📋 Còn {len(pending_rows)} dòng cần gán nhãn")
 
-            buffer_rows = []
-            buffer_tasks = []
+            def _default_result() -> dict:
+                return {
+                    "tier1_spam": "Not Spam",
+                    "tier2_toxic": "Clean",
+                    "tier3_labels": ["Neutral"],
+                }
 
-            def _flush_batch():
+            def _write_batch_results(batch_rows, predictions):
                 nonlocal processed, file_exists
-                predictions = classifier.predict(buffer_tasks)
                 csv_rows = []
-                for row_i, pred in zip(buffer_rows, predictions):
-                    t1 = pred["tier1_spam"]
-                    t2 = pred["tier2_toxic"]
-                    t3 = "|".join(pred["tier3_labels"]) if pred["tier3_labels"] else ""
+                for row_i, pred in zip(batch_rows, predictions):
+                    t1 = pred.get("tier1_spam", "Not Spam")
+                    t2 = pred.get("tier2_toxic", "Clean")
+                    t3_list = pred.get("tier3_labels", []) or []
+                    t3 = "|".join(t3_list) if t3_list else ""
+
                     label_counts[t1] = label_counts.get(t1, 0) + 1
                     label_counts[t2] = label_counts.get(t2, 0) + 1
-                    for lbl in pred["tier3_labels"]:
+                    for lbl in t3_list:
                         label_counts[lbl] = label_counts.get(lbl, 0) + 1
+
                     processed += 1
                     csv_rows.append({
                         "id": row_i.get("id", processed),
@@ -1470,43 +1496,136 @@ class App(ctk.CTk):
                         "tier2_toxic": t2,
                         "tier3_labels": t3,
                     })
+
                     rid = row_i.get("id", processed)
                     dt = str(row_i.get("text", "")).replace("\n", "  ")[:80]
                     self.after(0, lambda r=rid, d=dt, s1=t1, s2=t2, s3=t3:
                                self.lbl_tree.insert("", "end", values=(r, d, s1, s2, s3)))
-                pd.DataFrame(csv_rows).to_csv(labeled_path, mode="a", header=not file_exists, index=False, encoding="utf-8-sig")
-                file_exists = True
-                p = processed / total
+
+                if csv_rows:
+                    pd.DataFrame(csv_rows).to_csv(
+                        labeled_path,
+                        mode="a",
+                        header=not file_exists,
+                        index=False,
+                        encoding="utf-8-sig",
+                    )
+                    file_exists = True
+
+                p = (processed / total) if total else 0
                 pc = processed
                 self.after(0, lambda v=p: self.lbl_progress.set(v))
                 self.after(0, lambda v=pc, t=total: self.lbl_progress_text.configure(text=f"{v} / {t}"))
                 stats_str = " | ".join(f"{k}: {v}" for k, v in label_counts.items())
                 self.after(0, self._lbl_log, f"   ✓ Batch xong. [{stats_str}]")
 
-            try:
+            def _split_batches():
+                batches = []
+                buf_rows = []
+                buf_tasks = []
                 for row in pending_rows:
                     if self._lbl_stop_event.is_set():
-                        self.after(0, self._lbl_log, "🛑 Đã nhận lệnh DỪNG. Dữ liệu đã gán được lưu.")
                         break
-                    buffer_rows.append(row)
-                    buffer_tasks.append({"data": {"text": str(row.get("text", ""))}})
-                    if len(buffer_tasks) < batch_size:
-                        continue
-                    self.after(0, self._lbl_log, f"📤 Gửi batch {processed + 1}–{processed + len(buffer_tasks)} / {total} ...")
-                    _flush_batch()
-                    buffer_rows.clear()
-                    buffer_tasks.clear()
-                if buffer_tasks and not self._lbl_stop_event.is_set():
-                    self.after(0, self._lbl_log, f"📤 Gửi batch cuối {processed + 1}–{processed + len(buffer_tasks)} / {total} ...")
-                    _flush_batch()
+                    buf_rows.append(row)
+                    buf_tasks.append({"data": {"text": str(row.get("text", ""))}})
+                    if len(buf_tasks) >= batch_size:
+                        batches.append((buf_rows, buf_tasks))
+                        buf_rows = []
+                        buf_tasks = []
+                if buf_tasks and not self._lbl_stop_event.is_set():
+                    batches.append((buf_rows, buf_tasks))
+                return batches
+
+            try:
+                batches = _split_batches()
+                if self._lbl_stop_event.is_set():
+                    self.after(0, self._lbl_log, "🛑 Đã nhận lệnh DỪNG. Dữ liệu đã gán được lưu.")
+
+                if workers <= 1:
+                    # Sequential (backward compatible)
+                    for i, (batch_rows, batch_tasks) in enumerate(batches):
+                        if self._lbl_stop_event.is_set():
+                            self.after(0, self._lbl_log, "🛑 Đã nhận lệnh DỪNG. Dữ liệu đã gán được lưu.")
+                            break
+                        self.after(
+                            0,
+                            self._lbl_log,
+                            f"📤 Gửi batch {i + 1}/{len(batches)} (n={len(batch_tasks)}) ...",
+                        )
+                        predictions = classifier_single.predict(batch_tasks, retries=request_retries)
+                        if not isinstance(predictions, list) or len(predictions) != len(batch_tasks):
+                            predictions = [_default_result() for _ in batch_tasks]
+                        _write_batch_results(batch_rows, predictions)
+                else:
+                    # Concurrent: keep ordered writes/UI updates, but run predict() in parallel.
+                    thread_local = threading.local()
+
+                    def _predict_batch(batch_tasks):
+                        clf = getattr(thread_local, "classifier", None)
+                        if clf is None:
+                            clf = _make_classifier()
+                            thread_local.classifier = clf
+                        return clf.predict(batch_tasks, retries=request_retries)
+
+                    max_inflight = max(1, min(len(batches), workers * 2))
+                    inflight: dict[int, concurrent.futures.Future] = {}
+                    next_to_write = 0
+                    next_to_submit = 0
+
+                    ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+                    try:
+                        while next_to_write < len(batches):
+                            if self._lbl_stop_event.is_set():
+                                self.after(0, self._lbl_log, "🛑 Đã nhận lệnh DỪNG. Đang hủy các batch còn lại...")
+                                break
+
+                            while (not self._lbl_stop_event.is_set()) and next_to_submit < len(batches) and len(inflight) < max_inflight:
+                                batch_rows, batch_tasks = batches[next_to_submit]
+                                self.after(
+                                    0,
+                                    self._lbl_log,
+                                    f"📤 (Song song) Submit batch {next_to_submit + 1}/{len(batches)} (n={len(batch_tasks)}) ...",
+                                )
+                                inflight[next_to_submit] = ex.submit(_predict_batch, batch_tasks)
+                                next_to_submit += 1
+
+                            fut = inflight.get(next_to_write)
+                            if fut is None:
+                                break
+
+                            batch_rows, batch_tasks = batches[next_to_write]
+                            try:
+                                predictions = fut.result()
+                            except Exception:
+                                predictions = [_default_result() for _ in batch_tasks]
+
+                            inflight.pop(next_to_write, None)
+                            if not isinstance(predictions, list) or len(predictions) != len(batch_tasks):
+                                predictions = [_default_result() for _ in batch_tasks]
+
+                            _write_batch_results(batch_rows, predictions)
+                            next_to_write += 1
+                    finally:
+                        ex.shutdown(wait=not self._lbl_stop_event.is_set(), cancel_futures=True)
+
                 newly_labeled = processed - skipped
-                self.after(0, self._lbl_log, "\n" + "=" * 50)
-                self.after(0, self._lbl_log, f"✅ HOÀN TẤT: {processed}/{total} bình luận đã gán nhãn ({newly_labeled} mới gán)")
-                for lbl, cnt in label_counts.items():
-                    self.after(0, self._lbl_log, f"   {lbl}: {cnt}")
-                self.after(0, self._lbl_log, f"📂 Đã lưu: {labeled_path}")
-                final_msg = f"✅ Hoàn tất — {processed}/{total} dòng đã gán nhãn ({newly_labeled} mới) → labeled_data.csv"
-                self.after(0, lambda: self.lbl_status_label.configure(text=final_msg, text_color="green"))
+                if self._lbl_stop_event.is_set():
+                    self.after(0, self._lbl_log, "\n" + "=" * 50)
+                    self.after(0, self._lbl_log, f"🛑 ĐÃ DỪNG: {processed}/{total} bình luận đã được lưu ({newly_labeled} mới gán)")
+                    stats_str = " | ".join(f"{k}: {v}" for k, v in label_counts.items())
+                    if stats_str:
+                        self.after(0, self._lbl_log, f"   Thống kê: [{stats_str}]")
+                    self.after(0, self._lbl_log, f"📂 Đã lưu: {labeled_path}")
+                    stop_msg = f"🛑 Đã dừng — {processed}/{total} dòng đã lưu"
+                    self.after(0, lambda: self.lbl_status_label.configure(text=stop_msg, text_color="orange"))
+                else:
+                    self.after(0, self._lbl_log, "\n" + "=" * 50)
+                    self.after(0, self._lbl_log, f"✅ HOÀN TẤT: {processed}/{total} bình luận đã gán nhãn ({newly_labeled} mới gán)")
+                    for lbl, cnt in label_counts.items():
+                        self.after(0, self._lbl_log, f"   {lbl}: {cnt}")
+                    self.after(0, self._lbl_log, f"📂 Đã lưu: {labeled_path}")
+                    final_msg = f"✅ Hoàn tất — {processed}/{total} dòng đã gán nhãn ({newly_labeled} mới) → labeled_data.csv"
+                    self.after(0, lambda: self.lbl_status_label.configure(text=final_msg, text_color="green"))
             except Exception as e:
                 err_msg = str(e)
                 self.after(0, self._lbl_log, f"❌ Lỗi: {err_msg}")

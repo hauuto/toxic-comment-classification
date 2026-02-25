@@ -26,6 +26,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+import random
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -194,11 +196,41 @@ class GeminiHierarchicalClassifier:
             ],
         }
 
+        def _retry_sleep_seconds(attempt_index: int, response: requests.Response | None) -> float:
+            # attempt_index is 0-based (0 = first failure)
+            retry_after = None
+            if response is not None:
+                try:
+                    ra = response.headers.get("Retry-After")
+                    if ra:
+                        retry_after = float(ra)
+                except Exception:
+                    retry_after = None
+
+            # Exponential backoff with jitter; keep it bounded to avoid long stalls.
+            base = min(8.0, 1.0 * (2 ** min(attempt_index, 5)))  # 1,2,4,8,8,...
+            jitter = random.uniform(0.0, 0.35 * base)
+            delay = base + jitter
+            if retry_after is not None:
+                delay = max(delay, retry_after)
+            return min(delay, 15.0)
+
+        def _is_retryable_http(status_code: int) -> bool:
+            return status_code in (408, 429, 500, 502, 503, 504)
+
         last_error: Exception | None = None
-        for attempt in range(1 + retries):
+        last_response: requests.Response | None = None
+        for attempt in range(1 + max(0, int(retries))):
             try:
                 r = self.session.post(self.endpoint, json=payload, timeout=self.timeout)
-                r.raise_for_status()
+                last_response = r
+                if r.status_code >= 400:
+                    # Retryable errors: rate-limit / transient server issues.
+                    if _is_retryable_http(int(r.status_code)) and attempt < retries:
+                        time.sleep(_retry_sleep_seconds(attempt, r))
+                        continue
+                    r.raise_for_status()
+
                 data = r.json()
                 text = _get_gemini_text(data)
                 items = _parse_items(text, expected_n=len(tasks))
@@ -207,10 +239,16 @@ class GeminiHierarchicalClassifier:
                 if len(validated) == len(tasks):
                     return validated
 
+                # Parsed but shape mismatch → treat as retryable parsing failure.
+                raise ValueError("Gemini output parse mismatch")
+
             except Exception as e:
                 last_error = e
-                if attempt == retries:
-                    break
+                # If we hit a retryable case (timeouts, connection issues, parse mismatch), backoff.
+                if attempt < retries:
+                    time.sleep(_retry_sleep_seconds(attempt, last_response))
+                    continue
+                break
 
         _ = last_error
         return [_default_result() for _ in range(len(tasks))]
