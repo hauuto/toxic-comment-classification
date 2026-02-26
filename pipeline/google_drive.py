@@ -17,7 +17,10 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CREDENTIALS_FILE = os.path.join(_PROJECT_ROOT, 'credentials.json')
 TOKEN_FILE = os.path.join(_PROJECT_ROOT, 'token.json')
 DRIVE_ROOT_ID = '1GkjNZ3QeD_tsOZLBHq7fhMw9yVzEc1Os'
-SCOPES = ['https://www.googleapis.com/auth/drive']
+SCOPES = [
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/spreadsheets',
+]
 
 
 # =========================================================================== #

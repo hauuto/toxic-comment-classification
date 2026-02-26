@@ -43,6 +43,107 @@ load_dotenv()
 
 
 # =========================================================================== #
+#  Chrome version auto-detection (cross-machine compatibility)
+# =========================================================================== #
+
+def _detect_chrome_major_version() -> int | None:
+    """Auto-detect the installed Chrome/Chromium major version.
+
+    Tries multiple strategies so it works regardless of which Chrome version
+    each team member has installed:
+      1. Windows registry (most reliable on Windows)
+      2. CLI ``--version`` (Linux/macOS/Windows)
+      3. Windows file version via PowerShell
+      4. Returns None → lets undetected-chromedriver auto-detect (fallback)
+
+    Returns the major version number (e.g. 133) or None if detection fails.
+    """
+    import platform
+
+    # --- Strategy 1: Windows registry ---
+    if platform.system() == "Windows":
+        try:
+            import winreg
+            for reg_path in [
+                r"SOFTWARE\Google\Chrome\BLBeacon",
+                r"SOFTWARE\Wow6432Node\Google\Chrome\BLBeacon",
+            ]:
+                try:
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path)
+                    version_str, _ = winreg.QueryValueEx(key, "version")
+                    winreg.CloseKey(key)
+                    major = int(version_str.split(".")[0])
+                    if major > 0:
+                        return major
+                except Exception:
+                    continue
+        except ImportError:
+            pass
+
+    # --- Strategy 2: CLI --version ---
+    chrome_binaries: list[str] = []
+    if platform.system() == "Windows":
+        for p in [
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+        ]:
+            if os.path.isfile(p):
+                chrome_binaries.append(p)
+    else:
+        chrome_binaries = ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]
+
+    for binary in chrome_binaries:
+        try:
+            output = subprocess.check_output(
+                [binary, "--version"], stderr=subprocess.DEVNULL, timeout=5,
+            ).decode().strip()
+            # "Google Chrome 133.0.6943.98" → 133
+            match = re.search(r"(\d+)\.", output)
+            if match:
+                return int(match.group(1))
+        except Exception:
+            continue
+
+    # --- Strategy 3: Windows file version via PowerShell ---
+    if platform.system() == "Windows":
+        for p in [
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+        ]:
+            if os.path.isfile(p):
+                try:
+                    output = subprocess.check_output(
+                        ["powershell", "-Command",
+                         f"(Get-Item '{p}').VersionInfo.FileVersion"],
+                        stderr=subprocess.DEVNULL, timeout=5,
+                    ).decode().strip()
+                    match = re.search(r"(\d+)\.", output)
+                    if match:
+                        return int(match.group(1))
+                except Exception:
+                    continue
+
+    # --- Fallback: let uc auto-detect ---
+    return None
+
+
+# Cache the detected version so we only detect once per process
+_CHROME_MAJOR_VERSION: int | None = None
+_CHROME_VERSION_DETECTED: bool = False
+
+
+def _get_chrome_version() -> int | None:
+    """Return the cached Chrome major version, detecting on first call."""
+    global _CHROME_MAJOR_VERSION, _CHROME_VERSION_DETECTED
+    if not _CHROME_VERSION_DETECTED:
+        _CHROME_MAJOR_VERSION = _detect_chrome_major_version()
+        _CHROME_VERSION_DETECTED = True
+    return _CHROME_MAJOR_VERSION
+
+
+# =========================================================================== #
 #  Threads-specific text cleaning helpers
 # =========================================================================== #
 
@@ -929,13 +1030,14 @@ class VOZCrawler:
         simultaneously.
         """
         with self._driver_create_semaphore:
-            self._log(f"[VOZ] Khởi tạo Chrome Driver (worker {worker_id})...")
+            chrome_ver = _get_chrome_version()
+            self._log(f"[VOZ] Khởi tạo Chrome Driver (worker {worker_id}) — Chrome v{chrome_ver or 'auto'}...")
             user_data_dir = os.path.join(os.getcwd(), f"chrome_profile_voz_w{worker_id}")
             opts = uc.ChromeOptions()
             opts.add_argument("--disable-blink-features=AutomationControlled")
             opts.page_load_strategy = "eager"          # ← no longer waits for images/CSS
             driver = uc.Chrome(options=opts, user_data_dir=user_data_dir,
-                               version_main=None, use_subprocess=True)
+                               version_main=chrome_ver, use_subprocess=True)
             try:
                 driver.set_window_position(self.offset_x, 0)
                 time.sleep(0.5)
@@ -1364,13 +1466,14 @@ class ThreadsCrawler:
         return os.path.join(os.getcwd(), f"threads_{clean}_{self.max_posts}_{self.max_scroll}.csv")
 
     def get_driver(self):
-        self._log("[Threads] Khởi tạo Chrome Driver...")
+        chrome_ver = _get_chrome_version()
+        self._log(f"[Threads] Khởi tạo Chrome Driver — Chrome v{chrome_ver or 'auto'}...")
         user_data_dir = os.path.join(os.getcwd(), "chrome_profile_threads")
         opts = uc.ChromeOptions()
         opts.add_argument("--disable-blink-features=AutomationControlled")
         opts.add_argument("--disable-notifications")
         opts.page_load_strategy = "normal"
-        driver = uc.Chrome(options=opts, user_data_dir=user_data_dir, version_main=None, use_subprocess=True)
+        driver = uc.Chrome(options=opts, user_data_dir=user_data_dir, version_main=chrome_ver, use_subprocess=True)
         try:
             driver.set_window_position(self.offset_x, 0)
             time.sleep(1)

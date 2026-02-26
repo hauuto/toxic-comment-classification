@@ -156,6 +156,7 @@ def main() -> None:
                     "tier1_spam": t1,
                     "tier2_toxic": t2,
                     "tier3_labels": t3,
+                    "labeled_by": os.getlogin(),
                 }
             )
 

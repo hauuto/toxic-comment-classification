@@ -22,13 +22,13 @@ from nlp_pipeline.warehouse import (
     CLUSTER_SIZE_DEFAULT,
 )
 from nlp_pipeline import VietnameseCommentPreprocessor
-from google_drive import upload_warehouse, download_warehouse, upload_labeled_data, download_labeled_data
+from google_sheets import (sync_warehouse_push, sync_warehouse_pull,
+                            sync_labeled_push, sync_labeled_pull, get_cloud_stats,
+                            SheetsAPINotEnabledError)
 from lmstudio_classifier import (LMStudioClassifier, TIER1_LABELS, TIER2_LABELS,
                                   TIER3_TOXIC_LABELS, TIER3_CLEAN_LABELS, TIER3_ALL_LABELS)
 from gemini_hierarchical_classifier import GeminiHierarchicalClassifier
 from nlp_pipeline.word_segmentor import WordSegmentor
-from google_drive import upload_warehouse, download_warehouse
-from lmstudio_classifier import LMStudioClassifier
 
 import matplotlib
 matplotlib.use("Agg")
@@ -152,6 +152,57 @@ class App(ctk.CTk):
         self._setup_label_manager_tab()
         self._setup_file_manager_tab()
         self._setup_config_tab()
+
+        # Start background auto-sync checker (every 60 seconds)
+        self._auto_sync_interval = 60_000  # ms
+        self._start_auto_sync_checker()
+
+    # ---------------------------------------------------------
+    # AUTO-SYNC: Background cloud stats checker
+    # ---------------------------------------------------------
+    def _start_auto_sync_checker(self):
+        """Start a periodic background check for cloud data changes."""
+        self._check_cloud_stats_bg()
+
+    def _check_cloud_stats_bg(self):
+        """Run cloud stats check in background thread, then schedule next."""
+        def _check():
+            try:
+                stats = get_cloud_stats()
+                cloud_wh = stats.get("warehouse", -1)
+                cloud_lb = stats.get("labeled", -1)
+                local_wh = len(self._wh_all_rows) if hasattr(self, '_wh_all_rows') else 0
+                local_lb = len(self._lm_all_rows) if hasattr(self, '_lm_all_rows') else 0
+
+                parts = []
+                if cloud_wh >= 0:
+                    diff_wh = cloud_wh - local_wh
+                    if diff_wh > 0:
+                        parts.append(f"WH: +{diff_wh} mới")
+                    else:
+                        parts.append(f"WH: {cloud_wh}")
+                if cloud_lb >= 0:
+                    diff_lb = cloud_lb - local_lb
+                    if diff_lb > 0:
+                        parts.append(f"LB: +{diff_lb} mới")
+                    else:
+                        parts.append(f"LB: {cloud_lb}")
+
+                if parts:
+                    has_new = any("mới" in p for p in parts)
+                    icon = "🔔" if has_new else "☁"
+                    color = "#F59E0B" if has_new else "gray"
+                    text = f"{icon} Cloud: {' | '.join(parts)}"
+                    if hasattr(self, 'wh_cloud_label'):
+                        self.after(0, lambda: self.wh_cloud_label.configure(
+                            text=text, text_color=color))
+            except Exception:
+                pass  # Silently ignore – no network, etc.
+            finally:
+                # Schedule next check
+                self.after(self._auto_sync_interval, self._check_cloud_stats_bg)
+
+        threading.Thread(target=_check, daemon=True).start()
 
     def _get_preprocessor(self, segmentor_backend: str) -> VietnameseCommentPreprocessor:
         backend = (segmentor_backend or "").lower().strip() or "vncorenlp"
@@ -875,17 +926,19 @@ class App(ctk.CTk):
                        fg_color="red", hover_color="darkred",
                        command=self.wh_delete_selected).pack(side="right", padx=5)
 
-        # Row 3: Google Drive sync
+        # Row 3: Google Sheets sync (real-time multi-user)
         row3 = ctk.CTkFrame(header, fg_color="transparent")
         row3.pack(fill="x", padx=5, pady=(2, 5))
 
-        ctk.CTkLabel(row3, text="☁ Google Drive:", font=("Arial", 13, "bold")).pack(side="left", padx=(5, 10))
-        ctk.CTkButton(row3, text="⬆ Upload lên Drive", width=150,
+        ctk.CTkLabel(row3, text="☁ Cloud Sync:", font=("Arial", 13, "bold")).pack(side="left", padx=(5, 10))
+        ctk.CTkButton(row3, text="⬆ Sync Push", width=130,
                        fg_color="#EA580C", hover_color="#C2410C",
-                       command=self.wh_upload_drive).pack(side="left", padx=5)
-        ctk.CTkButton(row3, text="⬇ Tải từ Drive", width=150,
+                       command=self.wh_sync_push).pack(side="left", padx=5)
+        ctk.CTkButton(row3, text="⬇ Sync Pull", width=130,
                        fg_color="#0284C7", hover_color="#0369A1",
-                       command=self.wh_download_drive).pack(side="left", padx=5)
+                       command=self.wh_sync_pull).pack(side="left", padx=5)
+        self.wh_cloud_label = ctk.CTkLabel(row3, text="", text_color="gray")
+        self.wh_cloud_label.pack(side="left", padx=15)
 
         # --- Data table ---
         tf = ctk.CTkFrame(tab)
@@ -1091,85 +1144,84 @@ class App(ctk.CTk):
 
         threading.Thread(target=_process, daemon=True).start()
 
-    def wh_upload_drive(self):
-        """Upload warehouse.csv to Google Drive in background thread."""
+    def wh_sync_push(self):
+        """Push local warehouse rows to Google Sheets (append-only, dedup by id)."""
         if self._wh_is_processing:
             messagebox.showwarning("Nhắc nhở", "Đang xử lý, vui lòng đợi...")
             return
         if not self._wh_all_rows:
-            messagebox.showwarning("Nhắc nhở", "Warehouse trống, không có gì để upload.")
+            messagebox.showwarning("Nhắc nhở", "Warehouse trống, không có gì để push.")
             return
 
         self._wh_is_processing = True
-        self.wh_status_label.configure(text="⬆ Đang upload warehouse.csv lên Google Drive...", text_color="orange")
+        self.wh_status_label.configure(text="⬆ Đang sync push warehouse lên Google Sheets...", text_color="orange")
 
-        def _upload():
+        def _push():
             try:
                 def _log(msg):
-                    self.after(0, lambda: self.wh_status_label.configure(text=msg, text_color="orange"))
+                    self.after(0, lambda m=msg: self.wh_status_label.configure(text=m, text_color="orange"))
 
-                upload_warehouse(log_callback=_log)
+                pushed = sync_warehouse_push(log=_log)
                 self.after(0, lambda: self.wh_status_label.configure(
-                    text=f"✓ Đã upload warehouse.csv lên Google Drive ({len(self._wh_all_rows)} dòng).",
+                    text=f"✓ Sync Push hoàn tất — {pushed} dòng mới đã đẩy lên cloud.",
                     text_color="green"))
+            except SheetsAPINotEnabledError as e:
+                self.after(0, lambda: messagebox.showerror("Google Sheets API chưa bật", str(e)))
+                self.after(0, lambda: self.wh_status_label.configure(
+                    text="✗ Google Sheets API chưa được bật. Xem hướng dẫn trong popup.", text_color="red"))
             except FileNotFoundError as e:
                 self.after(0, lambda: messagebox.showerror("Lỗi", str(e)))
                 self.after(0, lambda: self.wh_status_label.configure(
-                    text="✗ Upload thất bại: thiếu credentials.", text_color="red"))
+                    text="✗ Sync Push thất bại: thiếu credentials.", text_color="red"))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Lỗi Upload", f"Không thể upload lên Drive:\n{str(e)}"))
+                self.after(0, lambda: messagebox.showerror("Lỗi Sync Push", f"Không thể push lên cloud:\n{str(e)}"))
                 self.after(0, lambda: self.wh_status_label.configure(
-                    text=f"✗ Upload thất bại: {str(e)[:80]}", text_color="red"))
+                    text=f"✗ Sync Push thất bại: {str(e)[:80]}", text_color="red"))
             finally:
                 self._wh_is_processing = False
 
-        threading.Thread(target=_upload, daemon=True).start()
+        threading.Thread(target=_push, daemon=True).start()
 
-    def wh_download_drive(self):
-        """Download warehouse.csv from Google Drive in background thread."""
+    def wh_sync_pull(self):
+        """Pull warehouse rows from Google Sheets and merge into local (dedup by id)."""
         if self._wh_is_processing:
             messagebox.showwarning("Nhắc nhở", "Đang xử lý, vui lòng đợi...")
             return
 
-        if self._wh_all_rows:
-            if not messagebox.askyesno(
-                "Xác nhận",
-                f"Warehouse hiện có {len(self._wh_all_rows)} dòng.\n"
-                "Tải từ Drive sẽ GHI ĐÈ toàn bộ dữ liệu local.\n\n"
-                "Bạn có muốn tiếp tục?"
-            ):
-                return
-
         self._wh_is_processing = True
-        self.wh_status_label.configure(text="⬇ Đang tải warehouse.csv từ Google Drive...", text_color="orange")
+        self.wh_status_label.configure(text="⬇ Đang sync pull warehouse từ Google Sheets...", text_color="orange")
 
-        def _download():
+        def _pull():
             try:
                 def _log(msg):
-                    self.after(0, lambda: self.wh_status_label.configure(text=msg, text_color="orange"))
+                    self.after(0, lambda m=msg: self.wh_status_label.configure(text=m, text_color="orange"))
 
-                success = download_warehouse(log_callback=_log)
-                if success:
+                pulled = sync_warehouse_pull(log=_log)
+                if pulled > 0:
                     self.after(0, self.wh_load_data)
                     self.after(0, lambda: self.wh_status_label.configure(
-                        text="✓ Đã tải warehouse.csv từ Google Drive và cập nhật.",
+                        text=f"✓ Sync Pull hoàn tất — {pulled} dòng mới từ cloud đã merge vào local.",
                         text_color="green"))
                 else:
                     self.after(0, lambda: self.wh_status_label.configure(
-                        text="✗ Không tìm thấy warehouse.csv trên Google Drive.",
-                        text_color="red"))
+                        text="✓ Sync Pull hoàn tất — local đã cập nhật, không có gì mới.",
+                        text_color="green"))
+            except SheetsAPINotEnabledError as e:
+                self.after(0, lambda: messagebox.showerror("Google Sheets API chưa bật", str(e)))
+                self.after(0, lambda: self.wh_status_label.configure(
+                    text="✗ Google Sheets API chưa được bật. Xem hướng dẫn trong popup.", text_color="red"))
             except FileNotFoundError as e:
                 self.after(0, lambda: messagebox.showerror("Lỗi", str(e)))
                 self.after(0, lambda: self.wh_status_label.configure(
-                    text="✗ Download thất bại: thiếu credentials.", text_color="red"))
+                    text="✗ Sync Pull thất bại: thiếu credentials.", text_color="red"))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Lỗi Download", f"Không thể tải từ Drive:\n{str(e)}"))
+                self.after(0, lambda: messagebox.showerror("Lỗi Sync Pull", f"Không thể pull từ cloud:\n{str(e)}"))
                 self.after(0, lambda: self.wh_status_label.configure(
-                    text=f"✗ Download thất bại: {str(e)[:80]}", text_color="red"))
+                    text=f"✗ Sync Pull thất bại: {str(e)[:80]}", text_color="red"))
             finally:
                 self._wh_is_processing = False
 
-        threading.Thread(target=_download, daemon=True).start()
+        threading.Thread(target=_pull, daemon=True).start()
 
     # ---------------------------------------------------------
     # TAB: AUTO LABELING (LM Studio)
@@ -1649,6 +1701,7 @@ class App(ctk.CTk):
                         "tier1_spam": t1,
                         "tier2_toxic": t2,
                         "tier3_labels": t3,
+                        "labeled_by": getattr(self, 'lm_username_var', None) and self.lm_username_var.get().strip() or os.getlogin(),
                     })
 
                     rid = row_i.get("id", processed)
@@ -1888,12 +1941,16 @@ class App(ctk.CTk):
         ctk.CTkOptionMenu(row2, values=["—"] + TIER3_ALL_LABELS, variable=self.lm_edit_t3_var, width=120).pack(side="left", padx=2)
         ctk.CTkButton(row2, text="Áp dụng", width=80, fg_color="#7C3AED", hover_color="#6D28D9", command=self._lm_edit_label).pack(side="left", padx=5)
 
-        # --- Drive sync + delete ---
+        # --- Cloud sync + delete ---
         ctk.CTkButton(row2, text="Xóa dòng chọn", width=110, fg_color="red", hover_color="darkred", command=self._lm_delete_selected).pack(side="right", padx=5)
-        ctk.CTkButton(row2, text="⬇ Drive", width=90, fg_color="#0284C7", hover_color="#0369A1",
-                       command=self._lm_download_drive).pack(side="right", padx=3)
-        ctk.CTkButton(row2, text="⬆ Drive", width=90, fg_color="#0284C7", hover_color="#0369A1",
-                       command=self._lm_upload_drive).pack(side="right", padx=3)
+        ctk.CTkButton(row2, text="⬇ Sync Pull", width=100, fg_color="#0284C7", hover_color="#0369A1",
+                       command=self._lm_sync_pull).pack(side="right", padx=3)
+        ctk.CTkButton(row2, text="⬆ Sync Push", width=100, fg_color="#EA580C", hover_color="#C2410C",
+                       command=self._lm_sync_push).pack(side="right", padx=3)
+        self.lm_username_var = ctk.StringVar(value=os.getlogin())
+        ctk.CTkEntry(row2, textvariable=self.lm_username_var, width=100,
+                     placeholder_text="Tên bạn").pack(side="right", padx=2)
+        ctk.CTkLabel(row2, text="👤").pack(side="right", padx=(5, 0))
 
         main_frame = ctk.CTkFrame(tab)
         main_frame.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
@@ -1977,6 +2034,7 @@ class App(ctk.CTk):
                             "tier1_spam": row.get("tier1_spam", "Not Spam"),
                             "tier2_toxic": row.get("tier2_toxic", "Clean"),
                             "tier3_labels": row.get("tier3_labels", ""),
+                            "labeled_by": row.get("labeled_by", "unknown"),
                         })
                     else:
                         # Backward compatibility: migrate old format (id, text, label)
@@ -1988,6 +2046,7 @@ class App(ctk.CTk):
                             "tier1_spam": t1,
                             "tier2_toxic": t2,
                             "tier3_labels": t3,
+                            "labeled_by": row.get("labeled_by", "unknown"),
                         })
             except Exception as e:
                 messagebox.showerror("Lỗi", f"Không thể đọc labeled_data.csv: {e}")
@@ -2052,7 +2111,7 @@ class App(ctk.CTk):
         labeled_path = self._get_labeled_data_path()
         try:
             with open(labeled_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=["id", "text", "tier1_spam", "tier2_toxic", "tier3_labels"])
+                writer = csv.DictWriter(f, fieldnames=["id", "text", "tier1_spam", "tier2_toxic", "tier3_labels", "labeled_by"])
                 writer.writeheader()
                 writer.writerows(self._lm_all_rows)
         except Exception as e:
@@ -2133,7 +2192,7 @@ class App(ctk.CTk):
         export_path = os.path.join(os.getcwd(), f"labeled_export_{timestamp}.csv")
         try:
             with open(export_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=["id", "text", "tier1_spam", "tier2_toxic", "tier3_labels"])
+                writer = csv.DictWriter(f, fieldnames=["id", "text", "tier1_spam", "tier2_toxic", "tier3_labels", "labeled_by"])
                 writer.writeheader()
                 writer.writerows(self._lm_all_rows)
             messagebox.showinfo("Thành công", f"Đã xuất {len(self._lm_all_rows)} dòng ra:\n{os.path.basename(export_path)}")
@@ -2230,87 +2289,87 @@ class App(ctk.CTk):
         plt.close(fig)
 
     # ---------------------------------------------------------
-    # LABEL MANAGER: Google Drive Sync
+    # LABEL MANAGER: Google Sheets Sync (real-time multi-user)
     # ---------------------------------------------------------
-    def _lm_upload_drive(self):
-        """Upload labeled_data.csv to Google Drive in background thread."""
+    def _lm_sync_push(self):
+        """Push local labeled_data rows to Google Sheets (append-only, dedup by id)."""
         if self._lm_is_processing:
             messagebox.showwarning("Nhắc nhở", "Đang xử lý, vui lòng đợi...")
             return
         if not self._lm_all_rows:
-            messagebox.showwarning("Nhắc nhở", "Chưa có dữ liệu labeled để upload.")
+            messagebox.showwarning("Nhắc nhở", "Chưa có dữ liệu labeled để push.")
             return
 
         self._lm_is_processing = True
-        self.lm_status_label.configure(text="⬆ Đang upload labeled_data.csv lên Google Drive...", text_color="orange")
+        self.lm_status_label.configure(text="⬆ Đang sync push labeled data lên Google Sheets...", text_color="orange")
 
-        def _upload():
+        def _push():
             try:
                 def _log(msg):
-                    self.after(0, lambda: self.lm_status_label.configure(text=msg, text_color="orange"))
+                    self.after(0, lambda m=msg: self.lm_status_label.configure(text=m, text_color="orange"))
 
-                upload_labeled_data(log_callback=_log)
+                username = self.lm_username_var.get().strip() or "unknown"
+                pushed = sync_labeled_push(labeled_by=username, log=_log)
                 self.after(0, lambda: self.lm_status_label.configure(
-                    text=f"✓ Đã upload labeled_data.csv lên Google Drive ({len(self._lm_all_rows)} dòng).",
+                    text=f"✓ Sync Push hoàn tất — {pushed} dòng labeled mới đã đẩy lên cloud.",
                     text_color="green"))
+            except SheetsAPINotEnabledError as e:
+                self.after(0, lambda: messagebox.showerror("Google Sheets API chưa bật", str(e)))
+                self.after(0, lambda: self.lm_status_label.configure(
+                    text="✗ Google Sheets API chưa được bật. Xem hướng dẫn trong popup.", text_color="red"))
             except FileNotFoundError as e:
                 self.after(0, lambda: messagebox.showerror("Lỗi", str(e)))
                 self.after(0, lambda: self.lm_status_label.configure(
-                    text="✗ Upload thất bại: thiếu credentials.", text_color="red"))
+                    text="✗ Sync Push thất bại: thiếu credentials.", text_color="red"))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Lỗi Upload", f"Không thể upload lên Drive:\n{str(e)}"))
+                self.after(0, lambda: messagebox.showerror("Lỗi Sync Push", f"Không thể push lên cloud:\n{str(e)}"))
                 self.after(0, lambda: self.lm_status_label.configure(
-                    text=f"✗ Upload thất bại: {str(e)[:80]}", text_color="red"))
+                    text=f"✗ Sync Push thất bại: {str(e)[:80]}", text_color="red"))
             finally:
                 self._lm_is_processing = False
 
-        threading.Thread(target=_upload, daemon=True).start()
+        threading.Thread(target=_push, daemon=True).start()
 
-    def _lm_download_drive(self):
-        """Download labeled_data.csv from Google Drive in background thread."""
+    def _lm_sync_pull(self):
+        """Pull labeled rows from Google Sheets and merge into local (dedup by id)."""
         if self._lm_is_processing:
             messagebox.showwarning("Nhắc nhở", "Đang xử lý, vui lòng đợi...")
             return
 
-        if self._lm_all_rows:
-            if not messagebox.askyesno(
-                "Xác nhận",
-                f"Labeled data hiện có {len(self._lm_all_rows)} dòng.\n"
-                "Tải từ Drive sẽ GHI ĐÈ toàn bộ dữ liệu local.\n\n"
-                "Bạn có muốn tiếp tục?"
-            ):
-                return
-
         self._lm_is_processing = True
-        self.lm_status_label.configure(text="⬇ Đang tải labeled_data.csv từ Google Drive...", text_color="orange")
+        self.lm_status_label.configure(text="⬇ Đang sync pull labeled data từ Google Sheets...", text_color="orange")
 
-        def _download():
+        def _pull():
             try:
                 def _log(msg):
-                    self.after(0, lambda: self.lm_status_label.configure(text=msg, text_color="orange"))
+                    self.after(0, lambda m=msg: self.lm_status_label.configure(text=m, text_color="orange"))
 
-                success = download_labeled_data(log_callback=_log)
-                if success:
+                pulled = sync_labeled_pull(log=_log)
+                if pulled > 0:
                     self.after(0, self._lm_load_data)
                     self.after(0, lambda: self.lm_status_label.configure(
-                        text="✓ Đã tải labeled_data.csv từ Google Drive và cập nhật.",
+                        text=f"✓ Sync Pull hoàn tất — {pulled} dòng labeled mới từ cloud đã merge vào local.",
                         text_color="green"))
                 else:
                     self.after(0, lambda: self.lm_status_label.configure(
-                        text="✗ Không tìm thấy labeled_data.csv trên Google Drive.",
-                        text_color="red"))
+                        text="✓ Sync Pull hoàn tất — local đã cập nhật, không có gì mới.",
+                        text_color="green"))
+            except SheetsAPINotEnabledError as e:
+                self.after(0, lambda: messagebox.showerror("Google Sheets API chưa bật", str(e)))
+                self.after(0, lambda: self.lm_status_label.configure(
+                    text="✗ Google Sheets API chưa được bật. Xem hướng dẫn trong popup.", text_color="red"))
             except FileNotFoundError as e:
                 self.after(0, lambda: messagebox.showerror("Lỗi", str(e)))
                 self.after(0, lambda: self.lm_status_label.configure(
-                    text="✗ Download thất bại: thiếu credentials.", text_color="red"))
+                    text="✗ Sync Pull thất bại: thiếu credentials.", text_color="red"))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Lỗi Download", f"Không thể tải từ Drive:\n{str(e)}"))
+                self.after(0, lambda: messagebox.showerror("Lỗi Sync Pull", f"Không thể pull từ cloud:\n{str(e)}"))
                 self.after(0, lambda: self.lm_status_label.configure(
-                    text=f"✗ Download thất bại: {str(e)[:80]}", text_color="red"))
+                    text=f"✗ Sync Pull thất bại: {str(e)[:80]}", text_color="red"))
             finally:
                 self._lm_is_processing = False
 
-        threading.Thread(target=_download, daemon=True).start()
+        threading.Thread(target=_pull, daemon=True).start()
 
     # ---------------------------------------------------------
     # TAB 4: FILE MANAGER
