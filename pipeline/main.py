@@ -451,6 +451,9 @@ class App(ctk.CTk):
         ctk.CTkLabel(self.kw_voz_frame, text="Max Pages:").pack(side="left", padx=(0, 5))
         self.kw_max_pages_var = ctk.StringVar(value="50")
         ctk.CTkEntry(self.kw_voz_frame, textvariable=self.kw_max_pages_var, width=60).pack(side="left", padx=(0, 15))
+        ctk.CTkLabel(self.kw_voz_frame, text="Workers:").pack(side="left", padx=(0, 5))
+        self.kw_num_workers_var = ctk.StringVar(value="3")
+        ctk.CTkEntry(self.kw_voz_frame, textvariable=self.kw_num_workers_var, width=40).pack(side="left", padx=(0, 15))
 
         # Threads params
         self.kw_threads_frame = ctk.CTkFrame(param_frame, fg_color="transparent")
@@ -662,6 +665,7 @@ class App(ctk.CTk):
         max_pages,
         max_posts,
         max_scroll,
+        num_workers=3,
     ):
         crawler = None
         try:
@@ -696,6 +700,7 @@ class App(ctk.CTk):
                         use_filter=u_fil,
                         use_normalizer=u_nor,
                         use_segmentor=use_segmentor,
+                        num_workers=num_workers,
                     )
                 else:
                     crawler = ThreadsCrawler(
@@ -771,6 +776,7 @@ class App(ctk.CTk):
         max_pages = int(self.kw_max_pages_var.get() or 50)
         max_posts = int(self.kw_max_posts_var.get() or 10)
         max_scroll = int(self.kw_max_scroll_var.get() or 30)
+        num_workers = int(self.kw_num_workers_var.get() or 3)
 
         self.kw_extracted_data = []
         self.kw_tree_data.delete(*self.kw_tree_data.get_children())
@@ -788,7 +794,7 @@ class App(ctk.CTk):
         thread = threading.Thread(
             target=self._keyword_crawl_thread,
             args=(keywords, platform, u_dec, u_fil, u_nor, use_segmentor, preprocessor,
-                  max_threads, max_pages, max_posts, max_scroll),
+                  max_threads, max_pages, max_posts, max_scroll, num_workers),
             daemon=True,
         )
         thread.start()
@@ -798,10 +804,10 @@ class App(ctk.CTk):
             self.kw_log_message("Đang gửi lệnh yêu cầu dừng...")
             self.kw_stop_event.set()
             self.kw_stop_button.configure(state="disabled", text="Đang dừng...")
-            # Also try to kill the browser directly for faster stop
+            # Also try to kill all browsers directly for faster stop
             if self.kw_active_crawler:
                 try:
-                    self.kw_active_crawler.force_kill_driver()
+                    self.kw_active_crawler.close()
                 except Exception:
                     pass
 

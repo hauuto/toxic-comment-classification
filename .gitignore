@@ -218,6 +218,8 @@ pipeline/cluster_history.json
 chrome_profile_fixed/
 chrome_profile_threads/
 
+models/
+
 
 
 *.csv
