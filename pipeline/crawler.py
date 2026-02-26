@@ -37,7 +37,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 
 from nlp_pipeline import VietnameseCommentPreprocessor
-from nlp_pipeline.warehouse import append_to_warehouse
+from nlp_pipeline.warehouse import append_to_warehouse, text_hash_id
 
 load_dotenv()
 
@@ -265,31 +265,41 @@ def _sanitize_keyword(keyword: str) -> str:
 
 
 def _append_batch_to_csv(file_path: str, batch_data: List[str]) -> int:
-    """Incremental CSV writer (id auto-increment)."""
+    """Incremental CSV writer (content-hash id)."""
     if not batch_data:
         return 0
     file_exists = os.path.isfile(file_path)
-    start_id = 1
+
+    # Read existing IDs for dedup
+    existing_ids: set = set()
     if file_exists:
         try:
             with open(file_path, "r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    try:
-                        rid = int(row["id"])
-                        if rid >= start_id:
-                            start_id = rid + 1
-                    except (ValueError, KeyError):
-                        pass
+                    rid = row.get("id", "")
+                    if rid:
+                        existing_ids.add(rid)
         except Exception:
-            start_id = 1
+            pass
+
+    new_rows = []
+    for text in batch_data:
+        rid = text_hash_id(text)
+        if rid not in existing_ids:
+            existing_ids.add(rid)
+            new_rows.append({"id": rid, "text": text})
+
+    if not new_rows:
+        return 0
+
     with open(file_path, "a", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=["id", "text"])
         if not file_exists:
             writer.writeheader()
-        for i, text in enumerate(batch_data):
-            writer.writerow({"id": start_id + i, "text": text})
-    return len(batch_data)
+        for r in new_rows:
+            writer.writerow(r)
+    return len(new_rows)
 
 
 # =========================================================================== #
@@ -319,7 +329,12 @@ def extract_youtube_comments(
     use_normalizer: bool = True, use_segmentor: bool = True,
     current_id: int = 1, seen_texts: set = None, extracted_data: list = None,
 ) -> int:
-    """Fetch all comments for a YouTube video via the Data API v3."""
+    """Fetch all comments for a YouTube video via the Data API v3.
+
+    .. note::
+       *current_id* is kept for API compatibility but **ignored**.
+       IDs are now generated via ``text_hash_id(text)``.
+    """
     def log(msg):
         if log_callback: log_callback(msg)
         else: print(msg)
@@ -385,8 +400,8 @@ def extract_youtube_comments(
                 clean_text = full_text
             if clean_text not in seen_texts:
                 seen_texts.add(clean_text)
-                row = {"id": current_id, "text": clean_text}
-                new_batch.append(row); extracted_data.append(row); current_id += 1
+                row = {"id": text_hash_id(clean_text), "text": clean_text}
+                new_batch.append(row); extracted_data.append(row)
 
         if new_batch:
             total_fetched += len(new_batch)
@@ -511,10 +526,9 @@ def _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocesso
                      
                 if clean_text not in seen_texts:
                     seen_texts.add(clean_text)
-                    item = {'id': current_id, 'text': clean_text}
+                    item = {'id': text_hash_id(clean_text), 'text': clean_text}
                     new_batch.append(item)
                     extracted_data.append(item)
-                    current_id += 1
             except Exception:
                 pass
         
@@ -634,10 +648,9 @@ def _extract_tiktok(page, log, current_id, seen_texts, stop_event, preprocessor,
                     
                 if clean_text not in seen_texts:
                     seen_texts.add(clean_text)
-                    item = {'id': current_id, 'text': clean_text}
+                    item = {'id': text_hash_id(clean_text), 'text': clean_text}
                     new_batch.append(item)
                     extracted_data.append(item)
-                    current_id += 1
             except Exception:
                 pass
                 
@@ -750,10 +763,9 @@ def _extract_threads(page, log, current_id, seen_texts, stop_event, preprocessor
                     
                 if clean_text not in seen_texts:
                     seen_texts.add(clean_text)
-                    item = {'id': current_id, 'text': clean_text}
+                    item = {'id': text_hash_id(clean_text), 'text': clean_text}
                     new_batch.append(item)
                     extracted_data.append(item)
-                    current_id += 1
             except Exception:
                 pass
                 
@@ -1351,7 +1363,7 @@ class VOZCrawler:
                         self._log(f"    [WAREHOUSE] +{wh_count} dòng (w{worker_id})")
                         if self.data_callback:
                             gui_batch = [
-                                {"id": start_idx + j, "text": t}
+                                {"id": text_hash_id(t), "text": t}
                                 for j, t in enumerate(processed_batch)
                             ]
                             self.data_callback(gui_batch)
@@ -1710,7 +1722,7 @@ class ThreadsCrawler:
                     wh_count = append_to_warehouse(wh_rows)
                     self._log(f"    [WAREHOUSE] +{wh_count} dòng")
                     if self.data_callback:
-                        gui_batch = [{"id": idx, "text": t} for idx, t in enumerate(processed_batch, start=len(all_texts) - len(processed_batch) + 1)]
+                        gui_batch = [{"id": text_hash_id(t), "text": t} for idx, t in enumerate(processed_batch, start=len(all_texts) - len(processed_batch) + 1)]
                         self.data_callback(gui_batch)
 
             except WebDriverException as e:

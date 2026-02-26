@@ -962,7 +962,7 @@ class App(ctk.CTk):
         self.wh_status_label.grid(row=2, column=0, pady=5, sticky="w", padx=10)
 
         # Internal data cache
-        self._wh_all_rows = []  # list of {"id": int, "text": str}
+        self._wh_all_rows = []  # list of {"id": str, "text": str}
         self._wh_is_processing = False
 
         # Initial load
@@ -1591,10 +1591,7 @@ class App(ctk.CTk):
                         raw_rows, fieldnames, enc_used = self._read_csv_dicts_with_fallback(labeled_path)
 
                     for erow in raw_rows:
-                        try:
-                            eid = int(erow.get("id", 0))
-                        except (ValueError, TypeError):
-                            eid = 0
+                        eid = str(erow.get("id", ""))
                         labeled_ids.add(eid)
                         existing_rows.append(erow)
                         # Rebuild label_counts from existing data
@@ -1617,14 +1614,11 @@ class App(ctk.CTk):
             total = len(rows)
 
             # Cluster-scoped resume: only count/pre-fill rows belonging to current cluster
-            cluster_ids = set(r.get("id", 0) for r in rows)
+            cluster_ids = set(str(r.get("id", "")) for r in rows)
             existing_rows_cluster = []
             if existing_rows:
                 for erow in existing_rows:
-                    try:
-                        eid = int(erow.get("id", 0))
-                    except Exception:
-                        continue
+                    eid = str(erow.get("id", ""))
                     if eid in cluster_ids:
                         existing_rows_cluster.append(erow)
 
@@ -1644,7 +1638,7 @@ class App(ctk.CTk):
                            f"♻ Tiếp tục từ {skipped}/{total} dòng đã gán nhãn trước đó")
 
             # Filter pending rows (skip already labeled)
-            pending_rows = [r for r in rows if r.get("id") not in labeled_ids]
+            pending_rows = [r for r in rows if str(r.get("id", "")) not in labeled_ids]
 
             if not pending_rows:
                 self.after(0, self._lbl_log, f"✅ Tất cả {total} dòng đã được gán nhãn. Không cần làm gì thêm.")

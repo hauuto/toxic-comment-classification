@@ -32,21 +32,20 @@ from gemini_hierarchical_classifier import GeminiHierarchicalClassifier
 POSTFIX_EVERY = 50
 
 
-def _load_existing_ids(output_path: str) -> set[int]:
+def _load_existing_ids(output_path: str) -> set[str]:
     if not os.path.exists(output_path):
         return set()
 
-    ids: set[int] = set()
+    ids: set[str] = set()
     encodings = ["utf-8-sig", "utf-8", "cp1258", "cp1252", "latin-1"]
     for enc in encodings:
         try:
             with open(output_path, "r", encoding=enc, newline="") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    try:
-                        ids.add(int(row.get("id", "0")))
-                    except Exception:
-                        continue
+                    rid = str(row.get("id", "")).strip()
+                    if rid:
+                        ids.add(rid)
             return ids
         except UnicodeDecodeError:
             continue
@@ -58,10 +57,9 @@ def _load_existing_ids(output_path: str) -> set[int]:
         with open(output_path, "r", encoding="utf-8", errors="replace", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                try:
-                    ids.add(int(row.get("id", "0")))
-                except Exception:
-                    continue
+                rid = str(row.get("id", "")).strip()
+                if rid:
+                    ids.add(rid)
     except Exception:
         return set()
 
@@ -96,7 +94,7 @@ def main() -> None:
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     file_exists = os.path.exists(args.output)
 
-    labeled_ids: set[int] = set()
+    labeled_ids: set[str] = set()
     if args.resume:
         labeled_ids = _load_existing_ids(args.output)
 
@@ -115,7 +113,7 @@ def main() -> None:
 
     total = len(df)
     if args.resume and labeled_ids:
-        total_pending = sum(1 for _, r in df.iterrows() if int(r.get(args.id_col, 0)) not in labeled_ids)
+        total_pending = sum(1 for _, r in df.iterrows() if str(r.get(args.id_col, "")) not in labeled_ids)
     else:
         total_pending = total
 
@@ -199,13 +197,9 @@ def main() -> None:
     try:
         if workers <= 1:
             for _, row in df.iterrows():
-                rid = row.get(args.id_col, 0)
-                try:
-                    rid_int = int(rid)
-                except Exception:
-                    rid_int = 0
+                rid = str(row.get(args.id_col, ""))
 
-                if args.resume and rid_int in labeled_ids:
+                if args.resume and rid in labeled_ids:
                     continue
 
                 buffer_rows.append(row)
@@ -231,13 +225,9 @@ def main() -> None:
             ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
             try:
                 for _, row in df.iterrows():
-                    rid = row.get(args.id_col, 0)
-                    try:
-                        rid_int = int(rid)
-                    except Exception:
-                        rid_int = 0
+                    rid = str(row.get(args.id_col, ""))
 
-                    if args.resume and rid_int in labeled_ids:
+                    if args.resume and rid in labeled_ids:
                         continue
 
                     buffer_rows.append(row)

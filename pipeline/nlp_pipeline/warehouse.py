@@ -1,15 +1,27 @@
 """
 warehouse.py – Append-only CSV warehouse for all crawled & preprocessed comments.
-File format: id,text (auto-increment id, permanent accumulation).
+File format: id,text (content-hash id for cross-machine dedup).
 Now lives inside nlp_pipeline/ package.
 """
 import os
 import csv
+import hashlib
 import threading
 import math
 from typing import Optional, List, Dict
 
 _lock = threading.Lock()
+
+
+def text_hash_id(text: str) -> str:
+    """Return a deterministic 16-char hex ID derived from *text*.
+
+    Using SHA-256 truncated to 16 hex chars (64 bits).  Two machines that
+    crawl the same comment will produce the **same** ID, which lets the
+    dedup logic in ``append_to_warehouse`` and Google Sheets sync work
+    correctly even when multiple users crawl in parallel.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 CLUSTER_SIZE_DEFAULT = 25_000
@@ -19,41 +31,39 @@ def _default_path() -> str:
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "warehouse.csv")
 
 
-def _get_max_id(warehouse_path: str) -> int:
-    """Return the current max id in the warehouse (0 if empty/missing)."""
+def _get_existing_ids(warehouse_path: str) -> set:
+    """Return the set of all IDs currently in the warehouse file."""
+    ids: set = set()
     if not os.path.isfile(warehouse_path):
-        return 0
-    max_id = 0
+        return ids
     try:
         with open(warehouse_path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                try:
-                    rid = int(row["id"])
-                    if rid > max_id:
-                        max_id = rid
-                except (ValueError, KeyError):
-                    pass
+                rid = row.get("id", "")
+                if rid:
+                    ids.add(str(rid))
     except Exception:
         pass
-    return max_id
+    return ids
 
 
 def append_to_warehouse(rows: list, warehouse_path: str = None) -> int:
-    """Append rows to warehouse.csv.
+    """Append rows to warehouse.csv (dedup by content-hash ID).
 
     Parameters
     ----------
     rows : list[dict]
-        Each dict must have key ``"text"``.  The ``"id"`` key is ignored –
-        ids are auto-assigned based on the current max id in the file.
+        Each dict must have key ``"text"``.  If ``"id"`` is present it is
+        used as-is; otherwise a content-hash ID is generated via
+        ``text_hash_id(text)``.
     warehouse_path : str, optional
         Path to the warehouse CSV.  Defaults to ``pipeline/warehouse.csv``.
 
     Returns
     -------
     int
-        Number of rows actually written.
+        Number of rows actually written (after dedup).
     """
     if not rows:
         return 0
@@ -62,16 +72,27 @@ def append_to_warehouse(rows: list, warehouse_path: str = None) -> int:
 
     with _lock:
         file_exists = os.path.isfile(warehouse_path)
-        start_id = _get_max_id(warehouse_path) + 1
+        existing_ids = _get_existing_ids(warehouse_path) if file_exists else set()
+
+        new_rows = []
+        for row in rows:
+            text = row.get("text", "")
+            rid = str(row.get("id", "")) or text_hash_id(text)
+            if rid not in existing_ids:
+                existing_ids.add(rid)
+                new_rows.append({"id": rid, "text": text})
+
+        if not new_rows:
+            return 0
 
         with open(warehouse_path, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["id", "text"])
             if not file_exists:
                 writer.writeheader()
-            for i, row in enumerate(rows):
-                writer.writerow({"id": start_id + i, "text": row.get("text", "")})
+            for r in new_rows:
+                writer.writerow(r)
 
-    return len(rows)
+    return len(new_rows)
 
 
 def get_warehouse_count(warehouse_path: str = None) -> int:
@@ -158,7 +179,7 @@ def read_warehouse_slice(offset: int, limit: int, warehouse_path: str = None) ->
                 if skipped < offset:
                     skipped += 1
                     continue
-                rows.append({"id": int(row.get("id", 0)), "text": row.get("text", "")})
+                rows.append({"id": str(row.get("id", "")), "text": row.get("text", "")})
                 if len(rows) >= limit:
                     break
     except Exception:
@@ -184,7 +205,7 @@ def read_warehouse(warehouse_path: str = None) -> list:
     Returns
     -------
     list[dict]
-        Each dict has keys ``"id"`` (int) and ``"text"`` (str).
+        Each dict has keys ``"id"`` (str) and ``"text"`` (str).
     """
     warehouse_path = warehouse_path or _default_path()
     if not os.path.isfile(warehouse_path):
@@ -194,7 +215,7 @@ def read_warehouse(warehouse_path: str = None) -> list:
         with open(warehouse_path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                rows.append({"id": int(row.get("id", 0)), "text": row.get("text", "")})
+                rows.append({"id": str(row.get("id", "")), "text": row.get("text", "")})
     except Exception:
         pass
     return rows
@@ -219,5 +240,5 @@ def overwrite_warehouse(rows: list, warehouse_path: str = None) -> int:
             writer = csv.DictWriter(f, fieldnames=["id", "text"])
             writer.writeheader()
             for row in rows:
-                writer.writerow({"id": row.get("id", 0), "text": row.get("text", "")})
+                writer.writerow({"id": row.get("id", ""), "text": row.get("text", "")})
     return len(rows)
