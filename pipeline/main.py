@@ -1320,8 +1320,26 @@ class App(ctk.CTk):
         except Exception:
             clusters = []
 
+        try:
+            total_rows = int(get_warehouse_count())
+        except Exception:
+            total_rows = 0
+
         options: dict[str, dict] = {}
         values: list[str] = []
+
+        # Add an "All" option first so user can run the full warehouse.
+        if total_rows > 0:
+            all_label = f"Toàn bộ (1–{total_rows}) — {total_rows}"
+            options[all_label] = {
+                "cluster_index": -1,
+                "start_id": 1,
+                "end_id": total_rows,
+                "size": total_rows,
+                "is_all": True,
+            }
+            values.append(all_label)
+
         for c in clusters:
             idx = int(c.get("cluster_index", 0))
             start_row = int(c.get("start_row", 0))
@@ -1386,10 +1404,16 @@ class App(ctk.CTk):
         self._lbl_save_cluster_history(history)
 
         if meta and meta.get("size", 0):
-            self.lbl_status_label.configure(
-                text=f"Trạng thái: Đã chọn Cluster {idx + 1} ({meta.get('start_id')}–{meta.get('end_id')})",
-                text_color="gray",
-            )
+            if meta.get("is_all") or idx < 0:
+                self.lbl_status_label.configure(
+                    text=f"Trạng thái: Đã chọn Toàn bộ (1–{meta.get('end_id')})",
+                    text_color="gray",
+                )
+            else:
+                self.lbl_status_label.configure(
+                    text=f"Trạng thái: Đã chọn Cluster {idx + 1} ({meta.get('start_id')}–{meta.get('end_id')})",
+                    text_color="gray",
+                )
 
     def _lbl_test_connection(self):
         gemini_enabled = bool(os.getenv("GEMINI_API_KEY", "").strip())
@@ -1450,7 +1474,10 @@ class App(ctk.CTk):
         selected_meta = self._lbl_cluster_options.get(selected_cluster_text, {})
         cluster_index = int(selected_meta.get("cluster_index", 0)) if selected_meta else 0
 
-        rows = read_warehouse_cluster(cluster_index=cluster_index, cluster_size=self._lbl_cluster_size)
+        if selected_meta.get("is_all") or cluster_index < 0:
+            rows = read_warehouse()
+        else:
+            rows = read_warehouse_cluster(cluster_index=cluster_index, cluster_size=self._lbl_cluster_size)
         if not rows:
             messagebox.showwarning("Lỗi", "Warehouse trống! Hãy crawl dữ liệu trước.")
             return
@@ -1485,9 +1512,12 @@ class App(ctk.CTk):
 
         self._lbl_log(f"🚀 Bắt đầu gán nhãn {len(rows)} bình luận")
         if selected_meta and selected_meta.get("size", 0):
-            self._lbl_log(
-                f"   Cluster: {cluster_index + 1} ({selected_meta.get('start_id')}–{selected_meta.get('end_id')})"
-            )
+            if selected_meta.get("is_all") or cluster_index < 0:
+                self._lbl_log(f"   Phạm vi: Toàn bộ (1–{selected_meta.get('end_id')})")
+            else:
+                self._lbl_log(
+                    f"   Cluster: {cluster_index + 1} ({selected_meta.get('start_id')}–{selected_meta.get('end_id')})"
+                )
         if gemini_enabled:
             self._lbl_log("   Provider: Gemini (Google AI Studio)")
             self._lbl_log(f"   Model: {effective_model}")

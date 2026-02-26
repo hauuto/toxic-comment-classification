@@ -32,6 +32,83 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 
+
+def _detect_chrome_major_version() -> int | None:
+    """Best-effort detect installed Chrome major version on Windows.
+
+    If detection fails, returns None (uc will try its own detection).
+    Users can override by setting env var CHROME_VERSION_MAIN.
+    """
+    try:
+        override = (os.getenv("CHROME_VERSION_MAIN") or "").strip()
+        if override.isdigit():
+            return int(override)
+    except Exception:
+        pass
+
+    # Windows registry is the most reliable + fast for Chrome version.
+    try:
+        import winreg  # type: ignore
+
+        reg_paths = [
+            (winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon"),
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\Google\Chrome\BLBeacon"),
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\Wow6432Node\Google\Chrome\BLBeacon"),
+        ]
+        for root, subkey in reg_paths:
+            try:
+                with winreg.OpenKey(root, subkey) as k:
+                    v, _ = winreg.QueryValueEx(k, "version")
+                if isinstance(v, str):
+                    m = re.search(r"(\d+)\.", v)
+                    if m:
+                        return int(m.group(1))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    candidates: list[str] = []
+    try:
+        # undetected_chromedriver may provide a helper.
+        find_exec = getattr(uc, "find_chrome_executable", None)
+        if callable(find_exec):
+            p = find_exec()
+            if p:
+                candidates.append(p)
+    except Exception:
+        pass
+
+    local_app_data = os.getenv("LOCALAPPDATA") or ""
+    program_files = os.getenv("ProgramFiles") or "C:\\Program Files"
+    program_files_x86 = os.getenv("ProgramFiles(x86)") or "C:\\Program Files (x86)"
+
+    candidates.extend(
+        [
+            os.path.join(program_files, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(program_files_x86, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"),
+        ]
+    )
+
+    for exe in candidates:
+        try:
+            if not exe or not os.path.exists(exe):
+                continue
+            out = subprocess.check_output(
+                [exe, "--version"],
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=5,
+            )
+            m = re.search(r"(\d+)\.", out)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            continue
+
+    return None
+
 from nlp_pipeline import VietnameseCommentPreprocessor
 from nlp_pipeline.warehouse import append_to_warehouse
 
@@ -816,7 +893,31 @@ class VOZCrawler:
         opts = uc.ChromeOptions()
         opts.add_argument("--disable-blink-features=AutomationControlled")
         opts.page_load_strategy = "normal"
-        driver = uc.Chrome(options=opts, user_data_dir=user_data_dir, version_main=None, use_subprocess=True)
+        version_main = _detect_chrome_major_version()
+        if version_main:
+            self._log(f"[VOZ] Detected Chrome major: {version_main}")
+        try:
+            driver = uc.Chrome(
+                options=opts,
+                user_data_dir=user_data_dir,
+                version_main=version_main,
+                use_subprocess=True,
+            )
+        except Exception as e:
+            # Retry once using the major version hinted by Selenium error.
+            msg = str(e)
+            m = re.search(r"Current browser version is (\d+)", msg)
+            if m:
+                hinted = int(m.group(1))
+                self._log(f"[VOZ] Retry with version_main={hinted} (from error)")
+                driver = uc.Chrome(
+                    options=opts,
+                    user_data_dir=user_data_dir,
+                    version_main=hinted,
+                    use_subprocess=True,
+                )
+            else:
+                raise
         try:
             driver.set_window_position(self.offset_x, 0)
             time.sleep(1)
@@ -1040,7 +1141,30 @@ class ThreadsCrawler:
         opts.add_argument("--disable-blink-features=AutomationControlled")
         opts.add_argument("--disable-notifications")
         opts.page_load_strategy = "normal"
-        driver = uc.Chrome(options=opts, user_data_dir=user_data_dir, version_main=None, use_subprocess=True)
+        version_main = _detect_chrome_major_version()
+        if version_main:
+            self._log(f"[Threads] Detected Chrome major: {version_main}")
+        try:
+            driver = uc.Chrome(
+                options=opts,
+                user_data_dir=user_data_dir,
+                version_main=version_main,
+                use_subprocess=True,
+            )
+        except Exception as e:
+            msg = str(e)
+            m = re.search(r"Current browser version is (\d+)", msg)
+            if m:
+                hinted = int(m.group(1))
+                self._log(f"[Threads] Retry with version_main={hinted} (from error)")
+                driver = uc.Chrome(
+                    options=opts,
+                    user_data_dir=user_data_dir,
+                    version_main=hinted,
+                    use_subprocess=True,
+                )
+            else:
+                raise
         try:
             driver.set_window_position(self.offset_x, 0)
             time.sleep(1)
