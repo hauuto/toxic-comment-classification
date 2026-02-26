@@ -34,6 +34,7 @@ dependencies = [
     "py-vncorenlp (>=0.1.4,<0.2.0)",
     "pyjnius (>=1.7.0,<2.0.0)",
     "underthesea (>=9.2.11,<10.0.0)",
+    "cloudscraper (>=1.2.71,<2.0.0)",
 ]
 
 [tool.poetry]
