@@ -1480,8 +1480,15 @@ class App(ctk.CTk):
         selected_meta = self._lbl_cluster_options.get(selected_cluster_text, {})
         cluster_index = int(selected_meta.get("cluster_index", 0)) if selected_meta else 0
 
-        if selected_meta.get("is_all") or cluster_index < 0:
+        is_all = bool(selected_meta.get("is_all")) or cluster_index < 0
+        if is_all:
             rows = read_warehouse()
+            # UX: when choosing "Toàn bộ", start from the last position (newest rows)
+            # instead of scanning top-down.
+            try:
+                rows = list(reversed(rows))
+            except Exception:
+                pass
         else:
             rows = read_warehouse_cluster(cluster_index=cluster_index, cluster_size=self._lbl_cluster_size)
         if not rows:
@@ -1518,8 +1525,9 @@ class App(ctk.CTk):
 
         self._lbl_log(f"🚀 Bắt đầu gán nhãn {len(rows)} bình luận")
         if selected_meta and selected_meta.get("size", 0):
-            if selected_meta.get("is_all") or cluster_index < 0:
+            if is_all:
                 self._lbl_log(f"   Phạm vi: Toàn bộ (1–{selected_meta.get('end_id')})")
+                self._lbl_log("   Thứ tự: từ CUỐI → ĐẦU (resume từ vị trí cuối cùng)")
             else:
                 self._lbl_log(
                     f"   Cluster: {cluster_index + 1} ({selected_meta.get('start_id')}–{selected_meta.get('end_id')})"
@@ -1736,9 +1744,22 @@ class App(ctk.CTk):
                             self._lbl_log,
                             f"📤 Gửi batch {i + 1}/{len(batches)} (n={len(batch_tasks)}) ...",
                         )
-                        predictions = classifier_single.predict(batch_tasks, retries=request_retries)
+                        try:
+                            predictions = classifier_single.predict(
+                                batch_tasks,
+                                retries=request_retries,
+                                strict=True,
+                            )
+                        except Exception as e:
+                            # Hard-fail on request error: do not silently label defaults.
+                            self._lbl_stop_event.set()
+                            raise RuntimeError(f"Request thất bại ở batch {i + 1}/{len(batches)}: {e}") from e
+
                         if not isinstance(predictions, list) or len(predictions) != len(batch_tasks):
-                            predictions = [_default_result() for _ in batch_tasks]
+                            self._lbl_stop_event.set()
+                            raise RuntimeError(
+                                f"Response không hợp lệ ở batch {i + 1}/{len(batches)}: got {type(predictions)} len={getattr(predictions, '__len__', lambda: '?')()}"
+                            )
                         _write_batch_results(batch_rows, predictions)
                 else:
                     # Concurrent: keep ordered writes/UI updates, but run predict() in parallel.
@@ -1749,7 +1770,7 @@ class App(ctk.CTk):
                         if clf is None:
                             clf = _make_classifier()
                             thread_local.classifier = clf
-                        return clf.predict(batch_tasks, retries=request_retries)
+                        return clf.predict(batch_tasks, retries=request_retries, strict=True)
 
                     max_inflight = max(1, min(len(batches), workers * 2))
                     inflight: dict[int, concurrent.futures.Future] = {}
@@ -1780,12 +1801,17 @@ class App(ctk.CTk):
                             batch_rows, batch_tasks = batches[next_to_write]
                             try:
                                 predictions = fut.result()
-                            except Exception:
-                                predictions = [_default_result() for _ in batch_tasks]
+                            except Exception as e:
+                                # Hard-fail on request error: stop and surface the error.
+                                self._lbl_stop_event.set()
+                                raise RuntimeError(f"Request thất bại ở batch {next_to_write + 1}/{len(batches)}: {e}") from e
 
                             inflight.pop(next_to_write, None)
                             if not isinstance(predictions, list) or len(predictions) != len(batch_tasks):
-                                predictions = [_default_result() for _ in batch_tasks]
+                                self._lbl_stop_event.set()
+                                raise RuntimeError(
+                                    f"Response không hợp lệ ở batch {next_to_write + 1}/{len(batches)}: got {type(predictions)} len={getattr(predictions, '__len__', lambda: '?')()}"
+                                )
 
                             _write_batch_results(batch_rows, predictions)
                             next_to_write += 1

@@ -63,6 +63,8 @@ Tier 3 can contain 0, 1, or multiple labels simultaneously.
 Reply with ONLY a JSON array (one object per input comment, same order). Each object:
 {"tier1_spam": "Spam" or "Not Spam", "tier2_toxic": "Toxic" or "Clean", "tier3_labels": ["label1", ...]}
 
+Return ONLY valid JSON. Do not include any explanations, markdown formatting, or backticks.
+
 Example for 2 comments:
 [
   {"tier1_spam": "Not Spam", "tier2_toxic": "Toxic", "tier3_labels": ["Obscene", "Harassment"]},
@@ -127,22 +129,39 @@ class LMStudioClassifier:
     # ------------------------------------------------------------------
     # Parse JSON response
     # ------------------------------------------------------------------
-    def _parse_json_response(self, content: str, n: int) -> List[Dict[str, Any]]:
+    def _parse_json_response(self, content: str, n: int, strict: bool = False) -> List[Dict[str, Any]]:
         """Parse model response (expected JSON array) into list of tier dicts.
 
         Returns list of dicts, each: {tier1_spam, tier2_toxic, tier3_labels}
         """
-        # Try to extract JSON array from the response
-        parsed = self._extract_json_array(content, n)
-        if parsed and len(parsed) == n:
+        content_str = str(content or "")
+
+        # 1) Try to extract JSON array from the response
+        parsed = self._extract_json_array(content_str, n)
+        if parsed is not None:
+            if strict and len(parsed) != n:
+                raise ValueError(f"Parsed JSON array length mismatch: expected {n}, got {len(parsed)}")
+            # In non-strict mode, keep backward compatibility (pad/trim to n)
+            parsed = (parsed[:n] if len(parsed) >= n else parsed + [self._default_result()] * (n - len(parsed)))
             return [self._validate_tier_result(obj) for obj in parsed]
 
-        # Fallback: try to find individual JSON objects
-        parsed = self._extract_json_objects(content, n)
-        if parsed and len(parsed) >= n:
-            return [self._validate_tier_result(obj) for obj in parsed[:n]]
+        # 2) Fallback: try to find individual JSON objects
+        parsed_objs = self._extract_json_objects(content_str, n)
+        if parsed_objs is not None:
+            if strict and len(parsed_objs) < n:
+                raise ValueError(f"Parsed JSON objects count mismatch: expected >= {n}, got {len(parsed_objs)}")
+            parsed_objs = parsed_objs[:n] if len(parsed_objs) >= n else parsed_objs
+            if len(parsed_objs) < n and not strict:
+                parsed_objs = parsed_objs + [self._default_result()] * (n - len(parsed_objs))
+            return [self._validate_tier_result(obj) for obj in parsed_objs]
 
-        # Last resort: return defaults
+        # 3) Parse failed
+        if strict:
+            snippet = content_str.strip().replace("\r", "")
+            snippet = snippet[:1200]
+            raise ValueError(f"Could not parse JSON from model output. Snippet: {snippet}")
+
+        # Backward-compatible last resort
         return [self._default_result() for _ in range(n)]
 
     def _extract_json_array(self, content: str, n: int) -> Optional[List[Dict]]:
@@ -248,7 +267,13 @@ class LMStudioClassifier:
     # ------------------------------------------------------------------
     # Predict
     # ------------------------------------------------------------------
-    def predict(self, tasks: List[Dict[str, Any]], retries: int = 1, **kwargs) -> List[Dict[str, Any]]:
+    def predict(
+        self,
+        tasks: List[Dict[str, Any]],
+        retries: int = 1,
+        strict: bool = False,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
         """Phân loại batch bình luận qua LM Studio API (Hierarchical 3-Tier).
 
         Parameters
@@ -282,27 +307,43 @@ class LMStudioClassifier:
         if self.model:
             payload["model"] = self.model
 
-        last_error = None
-        for attempt in range(1 + retries):
+        last_error: Exception | None = None
+        last_response_text: str = ""
+        # retries means: additional tries after the first one
+        max_attempts = 1 + max(0, int(retries))
+        for attempt in range(max_attempts):
             try:
                 r = self.session.post(self.endpoint, json=payload, timeout=self.timeout)
                 r.raise_for_status()
-                result = r.json()
-                content = result["choices"][0]["message"]["content"]
-                parsed = self._parse_json_response(content, len(tasks))
+                try:
+                    result = r.json()
+                except Exception as e:
+                    last_response_text = (r.text or "")[:800]
+                    raise RuntimeError(f"LM Studio returned non-JSON response: {last_response_text}") from e
 
-                # Check if we got valid results (not all defaults)
-                has_real = any(
-                    p["tier1_spam"] != "Not Spam" or p["tier2_toxic"] != "Clean" or p["tier3_labels"] != ["Neutral"]
-                    for p in parsed
-                )
-                if has_real or attempt == retries:
-                    return parsed
+                # OpenAI-compatible error schema
+                if isinstance(result, dict) and result.get("error"):
+                    raise RuntimeError(f"LM Studio error: {result.get('error')}")
+
+                try:
+                    content = result["choices"][0]["message"]["content"]
+                except Exception as e:
+                    last_response_text = (json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result))[:800]
+                    raise RuntimeError(f"LM Studio response missing choices/message/content: {last_response_text}") from e
+
+                parsed = self._parse_json_response(content, len(tasks), strict=strict)
+
+                # If we parsed a valid structure, return it (strict mode already enforces parse success).
+                return parsed
 
             except Exception as e:
                 last_error = e
-                if attempt == retries:
+                if attempt >= (max_attempts - 1):
                     break
 
-        # All retries failed → return defaults
+        if strict:
+            msg = str(last_error) if last_error else "Unknown error"
+            raise RuntimeError(f"LM Studio request failed after {max_attempts} attempt(s): {msg}")
+
+        # Backward-compatible fallback: All retries failed → return defaults
         return [self._default_result() for _ in range(len(tasks))]

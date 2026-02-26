@@ -75,6 +75,8 @@ Reply with ONLY a JSON object with this exact shape:
   ...
 ]}
 
+Return ONLY a valid JSON object. Do not include any explanations, markdown formatting, or backticks.
+
 General Rules:
 - Evaluate tiers independently but logically consistent.
 - If Tier 2 = "Toxic", Tier 3 MUST contain at least one toxic label.
@@ -180,13 +182,21 @@ class GeminiHierarchicalClassifier:
     # ------------------------------------------------------------------
     # Predict
     # ------------------------------------------------------------------
-    def predict(self, tasks: List[Dict[str, Any]], retries: int = 1, **kwargs) -> List[Dict[str, Any]]:
+    def predict(
+        self,
+        tasks: List[Dict[str, Any]],
+        retries: int = 1,
+        strict: bool = False,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
         texts = [str(t.get("data", {}).get("text", "")) for t in tasks]
         user_msg = self._build_user_message(texts)
 
-        max_tokens = max(256, len(texts) * self.max_output_tokens_per_item)
+        # Baseline token budget. In practice, JSON can be truncated even when HTTP=200;
+        # give some headroom and scale up on retries.
+        base_max_tokens = max(512, int(len(texts) * self.max_output_tokens_per_item * 2))
 
-        payload: Dict[str, Any] = {
+        base_payload: Dict[str, Any] = {
             "contents": [
                 {
                     "parts": [
@@ -196,7 +206,8 @@ class GeminiHierarchicalClassifier:
             ],
             "generationConfig": {
                 "temperature": self.temperature,
-                "maxOutputTokens": max_tokens,
+                # maxOutputTokens set per-attempt (scaled)
+                "maxOutputTokens": base_max_tokens,
             },
             "safetySettings": [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -230,20 +241,39 @@ class GeminiHierarchicalClassifier:
 
         last_error: Exception | None = None
         last_response: requests.Response | None = None
-        for attempt in range(1 + max(0, int(retries))):
+        last_body_snippet: str = ""
+        max_attempts = 1 + max(0, int(retries))
+        for attempt in range(max_attempts):
             try:
+                # Scale tokens on each retry to avoid truncated JSON.
+                scaled_max_tokens = int(base_max_tokens * (1.8 ** attempt))
+                scaled_max_tokens = max(base_max_tokens, scaled_max_tokens)
+                scaled_max_tokens = min(scaled_max_tokens, 8192)
+
+                payload = dict(base_payload)
+                payload["generationConfig"] = dict(base_payload.get("generationConfig", {}))
+                payload["generationConfig"]["maxOutputTokens"] = scaled_max_tokens
+
                 r = self.session.post(self.endpoint, json=payload, timeout=self.timeout)
                 last_response = r
                 if r.status_code >= 400:
                     # Retryable errors: rate-limit / transient server issues.
-                    if _is_retryable_http(int(r.status_code)) and attempt < retries:
+                    if _is_retryable_http(int(r.status_code)) and attempt < (max_attempts - 1):
                         time.sleep(_retry_sleep_seconds(attempt, r))
                         continue
+                    try:
+                        last_body_snippet = (r.text or "")[:1200]
+                    except Exception:
+                        last_body_snippet = ""
                     r.raise_for_status()
 
-                data = r.json()
+                try:
+                    data = r.json()
+                except Exception as e:
+                    last_body_snippet = (r.text or "")[:1200]
+                    raise RuntimeError(f"Gemini returned non-JSON response: {last_body_snippet}") from e
                 text = _get_gemini_text(data)
-                items = _parse_items(text, expected_n=len(tasks))
+                items = _parse_items(text, expected_n=len(tasks), strict=strict)
                 validated = [_validate_tier_result(obj) for obj in items]
 
                 if len(validated) == len(tasks):
@@ -255,10 +285,25 @@ class GeminiHierarchicalClassifier:
             except Exception as e:
                 last_error = e
                 # If we hit a retryable case (timeouts, connection issues, parse mismatch), backoff.
-                if attempt < retries:
+                if attempt < (max_attempts - 1):
                     time.sleep(_retry_sleep_seconds(attempt, last_response))
                     continue
                 break
+
+        if strict:
+            status = None
+            if last_response is not None:
+                try:
+                    status = int(last_response.status_code)
+                except Exception:
+                    status = None
+            msg = str(last_error) if last_error else "Unknown error"
+            if status is not None:
+                detail = (last_body_snippet or "").strip()
+                if detail:
+                    raise RuntimeError(f"Gemini request failed (HTTP {status}) after {max_attempts} attempt(s): {msg}\nResponse: {detail}")
+                raise RuntimeError(f"Gemini request failed (HTTP {status}) after {max_attempts} attempt(s): {msg}")
+            raise RuntimeError(f"Gemini request failed after {max_attempts} attempt(s): {msg}")
 
         _ = last_error
         return [_default_result() for _ in range(len(tasks))]
@@ -285,7 +330,7 @@ def _extract_json_by_brackets(text: str, open_ch: str, close_ch: str) -> Optiona
     return text[start : end + 1]
 
 
-def _parse_items(content: str, expected_n: int) -> List[Dict[str, Any]]:
+def _parse_items(content: str, expected_n: int, strict: bool = False) -> List[Dict[str, Any]]:
     """Parse Gemini output into a list of dict items.
 
     Accepts either:
@@ -294,6 +339,8 @@ def _parse_items(content: str, expected_n: int) -> List[Dict[str, Any]]:
     - single object: { ... }  (treated as one item)
     """
     if not content:
+        if strict:
+            raise ValueError("Empty model output (possibly safety-blocked or missing content)")
         return [_default_result() for _ in range(expected_n)]
 
     content = _strip_code_fences(content)
@@ -301,22 +348,31 @@ def _parse_items(content: str, expected_n: int) -> List[Dict[str, Any]]:
     # 1) direct json
     items = _try_parse_items_json(content)
     if items is not None:
-        return _pad_or_trim(items, expected_n)
+        if strict and expected_n > 0 and len(items) != expected_n:
+            raise ValueError(f"Gemini parsed items length mismatch: expected {expected_n}, got {len(items)}")
+        return _pad_or_trim(items, expected_n) if not strict else items
 
     # 2) try extract {...}
     obj_str = _extract_json_by_brackets(content, "{", "}")
     if obj_str:
         items = _try_parse_items_json(obj_str)
         if items is not None:
-            return _pad_or_trim(items, expected_n)
+            if strict and expected_n > 0 and len(items) != expected_n:
+                raise ValueError(f"Gemini parsed items length mismatch: expected {expected_n}, got {len(items)}")
+            return _pad_or_trim(items, expected_n) if not strict else items
 
     # 3) try extract [...]
     arr_str = _extract_json_by_brackets(content, "[", "]")
     if arr_str:
         items = _try_parse_items_json(arr_str)
         if items is not None:
-            return _pad_or_trim(items, expected_n)
+            if strict and expected_n > 0 and len(items) != expected_n:
+                raise ValueError(f"Gemini parsed items length mismatch: expected {expected_n}, got {len(items)}")
+            return _pad_or_trim(items, expected_n) if not strict else items
 
+    if strict:
+        snippet = str(content).strip().replace("\r", "")[:1200]
+        raise ValueError(f"Could not parse JSON from Gemini output. Snippet: {snippet}")
     return [_default_result() for _ in range(expected_n)]
 
 
