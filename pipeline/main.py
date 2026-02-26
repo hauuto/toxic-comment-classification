@@ -5,6 +5,8 @@ import time
 import json
 import re
 import threading
+import concurrent.futures
+import shutil
 from datetime import datetime, timezone
 import customtkinter as ctk
 from tkinter import messagebox, ttk
@@ -177,6 +179,147 @@ class App(ctk.CTk):
             pp = VietnameseCommentPreprocessor(segmentor_backend="vncorenlp", vncorenlp_dir=models_dir)
         self._preprocessor_cache["vncorenlp"] = pp
         return pp
+
+    # ---------------------------------------------------------
+    # CSV helpers (robust encoding)
+    # ---------------------------------------------------------
+    @staticmethod
+    def _read_csv_dicts_with_fallback(path: str) -> tuple[list[dict], list[str], str]:
+        """Read a CSV file into list[dict] with encoding fallback.
+
+        Returns: (rows, fieldnames, encoding_used)
+        """
+        encodings = ["utf-8-sig", "utf-8", "cp1258", "cp1252", "latin-1"]
+        last_err: Exception | None = None
+        for enc in encodings:
+            try:
+                with open(path, "r", encoding=enc, newline="") as f:
+                    reader = csv.DictReader(f)
+                    rows = list(reader)
+                    fieldnames = list(reader.fieldnames or [])
+                return rows, fieldnames, enc
+            except UnicodeDecodeError as e:
+                last_err = e
+                continue
+            except Exception as e:
+                # Non-decoding errors shouldn't be masked by fallback.
+                raise e
+
+        # Last resort: replace invalid bytes to avoid crashing UI.
+        _ = last_err
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            fieldnames = list(reader.fieldnames or [])
+        return rows, fieldnames, "utf-8(replace)"
+
+    @staticmethod
+    def _backup_file(path: str) -> str:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        bak_path = f"{path}.bak_{ts}"
+        try:
+            shutil.copy2(path, bak_path)
+        except Exception:
+            # Best-effort backup
+            pass
+        return bak_path
+
+    @staticmethod
+    def _looks_mojibake(s: str) -> bool:
+        # Common UTF-8->cp1252/latin1 mojibake fragments seen in Vietnamese text.
+        patterns = ("ï»¿", "Ã", "Â", "Ä", "áº", "Æ°", "â€")
+        return any(p in s for p in patterns)
+
+    @staticmethod
+    def _fix_mojibake_text(s: str) -> str:
+        # Try to undo UTF-8 bytes that were incorrectly decoded as latin-1/cp1252 and then re-encoded.
+        # This is safe because it only applies when s is encodable in latin-1.
+        out = s
+        for _ in range(2):
+            if not App._looks_mojibake(out):
+                break
+            try:
+                out2 = out.encode("latin-1").decode("utf-8")
+            except Exception:
+                break
+            if out2 == out:
+                break
+            out = out2
+        return out
+
+    @staticmethod
+    def _normalize_fieldname(name: str) -> str:
+        # Strip BOM and whitespace. Some tools may embed BOM (U+FEFF) into the header name.
+        return (name or "").replace("\ufeff", "").strip()
+
+    @staticmethod
+    def _sanitize_csv_row(row: dict) -> dict:
+        # DictReader stores extra columns under key None.
+        if row is None:
+            return {}
+        if None in row:
+            try:
+                row = dict(row)
+                row.pop(None, None)
+            except Exception:
+                return {}
+
+        cleaned: dict[str, str] = {}
+        for k, v in row.items():
+            if k is None:
+                continue
+            key = str(k)
+            if App._looks_mojibake(key):
+                key = App._fix_mojibake_text(key)
+            key = App._normalize_fieldname(key)
+            if not key:
+                continue
+
+            if v is None:
+                cleaned[key] = ""
+            else:
+                val = str(v)
+                if App._looks_mojibake(val):
+                    val = App._fix_mojibake_text(val)
+                cleaned[key] = val
+        return cleaned
+
+    @staticmethod
+    def _rewrite_csv_utf8sig(path: str, rows: list[dict], fieldnames: list[str]) -> None:
+        sanitized_rows: list[dict] = []
+        for r in rows:
+            if isinstance(r, dict):
+                sanitized_rows.append(App._sanitize_csv_row(r))
+
+        if not fieldnames:
+            # Infer from sanitized rows
+            keys: list[str] = []
+            seen: set[str] = set()
+            for r in sanitized_rows:
+                for k in r.keys():
+                    if k not in seen:
+                        seen.add(k)
+                        keys.append(k)
+            fieldnames = keys
+        else:
+            normalized: list[str] = []
+            for fn in fieldnames:
+                if fn is None:
+                    continue
+                name = str(fn)
+                if App._looks_mojibake(name):
+                    name = App._fix_mojibake_text(name)
+                name = App._normalize_fieldname(name)
+                if name:
+                    normalized.append(name)
+            fieldnames = normalized
+            fieldnames = [fn for fn in fieldnames if fn]
+
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for r in sanitized_rows:
+                writer.writerow(r)
 
     # ---------------------------------------------------------
     # TAB 1: CRAWLER
@@ -1065,6 +1208,10 @@ class App(ctk.CTk):
         self.lbl_batch_var = ctk.StringVar(value="5")
         ctk.CTkEntry(ctrl_frame, textvariable=self.lbl_batch_var, width=60).pack(side="left", padx=(0, 15))
 
+        ctk.CTkLabel(ctrl_frame, text="Workers:").pack(side="left", padx=(5, 5))
+        self.lbl_workers_var = ctk.StringVar(value="4")
+        ctk.CTkEntry(ctrl_frame, textvariable=self.lbl_workers_var, width=60).pack(side="left", padx=(0, 15))
+
         # Cluster selector (25k rows per cluster)
         ctk.CTkLabel(ctrl_frame, text="Cluster:").pack(side="left", padx=(5, 5))
         self.lbl_cluster_var = ctk.StringVar(value="")
@@ -1317,6 +1464,13 @@ class App(ctk.CTk):
             batch_size = max(1, min(int(self.lbl_batch_var.get()), 20))
         except ValueError:
             batch_size = 5
+
+        try:
+            workers = int((self.lbl_workers_var.get() or "").strip() or "1")
+        except Exception:
+            workers = 1
+        workers = max(1, min(workers, 32))
+        request_retries = 3 if gemini_enabled else 1
         model_name = self.lbl_model_var.get().strip()
         effective_model = model_name or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
@@ -1349,15 +1503,23 @@ class App(ctk.CTk):
             self._lbl_log(f"   Endpoint: {endpoint}")
             self._lbl_log(f"   Model: {model_name or '(auto)'}")
         self._lbl_log(f"   Batch size: {batch_size}")
+        self._lbl_log(f"   Workers: {workers}")
         self._lbl_log("=" * 50)
 
         def _labeling_thread():
             import pandas as pd
-            if gemini_enabled:
-                classifier = GeminiHierarchicalClassifier(model=effective_model, timeout=120)
-            else:
-                endpoint = f"{base_url.rstrip('/')}/v1/chat/completions"
-                classifier = LMStudioClassifier(endpoint=endpoint, model=model_name, timeout=120)
+            # NOTE: For multi-threading, each worker thread will keep its own classifier instance
+            # (requests.Session is not guaranteed thread-safe).
+            endpoint = f"{base_url.rstrip('/')}/v1/chat/completions"
+
+            def _make_classifier():
+                if gemini_enabled:
+                    return GeminiHierarchicalClassifier(model=effective_model, timeout=120)
+                return LMStudioClassifier(endpoint=endpoint, model=model_name, timeout=120)
+
+            classifier_single = None
+            if workers <= 1:
+                classifier_single = _make_classifier()
             labeled_path = self._get_labeled_data_path()
 
             # --- Load existing labeled data for resume support ---
@@ -1368,28 +1530,34 @@ class App(ctk.CTk):
 
             if os.path.exists(labeled_path):
                 try:
-                    with open(labeled_path, "r", encoding="utf-8-sig") as f:
-                        reader = csv.DictReader(f)
-                        for erow in reader:
-                            try:
-                                eid = int(erow.get("id", 0))
-                            except (ValueError, TypeError):
-                                eid = 0
-                            labeled_ids.add(eid)
-                            existing_rows.append(erow)
-                            # Rebuild label_counts from existing data
-                            t1 = erow.get("tier1_spam", "")
-                            t2 = erow.get("tier2_toxic", "")
-                            t3_str = erow.get("tier3_labels", "")
-                            if t1:
-                                label_counts[t1] = label_counts.get(t1, 0) + 1
-                            if t2:
-                                label_counts[t2] = label_counts.get(t2, 0) + 1
-                            if t3_str:
-                                for lbl in t3_str.split("|"):
-                                    lbl = lbl.strip()
-                                    if lbl:
-                                        label_counts[lbl] = label_counts.get(lbl, 0) + 1
+                    raw_rows, fieldnames, enc_used = self._read_csv_dicts_with_fallback(labeled_path)
+                    # If file is legacy encoding (e.g., cp1258), convert once to utf-8-sig to prevent future errors.
+                    if enc_used not in ("utf-8-sig", "utf-8", "utf-8(replace)"):
+                        self._backup_file(labeled_path)
+                        self._rewrite_csv_utf8sig(labeled_path, raw_rows, fieldnames)
+                        # Re-read using utf-8-sig for consistency
+                        raw_rows, fieldnames, enc_used = self._read_csv_dicts_with_fallback(labeled_path)
+
+                    for erow in raw_rows:
+                        try:
+                            eid = int(erow.get("id", 0))
+                        except (ValueError, TypeError):
+                            eid = 0
+                        labeled_ids.add(eid)
+                        existing_rows.append(erow)
+                        # Rebuild label_counts from existing data
+                        t1 = erow.get("tier1_spam", "")
+                        t2 = erow.get("tier2_toxic", "")
+                        t3_str = erow.get("tier3_labels", "")
+                        if t1:
+                            label_counts[t1] = label_counts.get(t1, 0) + 1
+                        if t2:
+                            label_counts[t2] = label_counts.get(t2, 0) + 1
+                        if t3_str:
+                            for lbl in str(t3_str).split("|"):
+                                lbl = lbl.strip()
+                                if lbl:
+                                    label_counts[lbl] = label_counts.get(lbl, 0) + 1
                     file_exists = len(labeled_ids) > 0
                 except Exception:
                     pass
@@ -1453,21 +1621,27 @@ class App(ctk.CTk):
 
             self.after(0, self._lbl_log, f"📋 Còn {len(pending_rows)} dòng cần gán nhãn")
 
-            buffer_rows = []
-            buffer_tasks = []
+            def _default_result() -> dict:
+                return {
+                    "tier1_spam": "Not Spam",
+                    "tier2_toxic": "Clean",
+                    "tier3_labels": ["Neutral"],
+                }
 
-            def _flush_batch():
+            def _write_batch_results(batch_rows, predictions):
                 nonlocal processed, file_exists
-                predictions = classifier.predict(buffer_tasks)
                 csv_rows = []
-                for row_i, pred in zip(buffer_rows, predictions):
-                    t1 = pred["tier1_spam"]
-                    t2 = pred["tier2_toxic"]
-                    t3 = "|".join(pred["tier3_labels"]) if pred["tier3_labels"] else ""
+                for row_i, pred in zip(batch_rows, predictions):
+                    t1 = pred.get("tier1_spam", "Not Spam")
+                    t2 = pred.get("tier2_toxic", "Clean")
+                    t3_list = pred.get("tier3_labels", []) or []
+                    t3 = "|".join(t3_list) if t3_list else ""
+
                     label_counts[t1] = label_counts.get(t1, 0) + 1
                     label_counts[t2] = label_counts.get(t2, 0) + 1
-                    for lbl in pred["tier3_labels"]:
+                    for lbl in t3_list:
                         label_counts[lbl] = label_counts.get(lbl, 0) + 1
+
                     processed += 1
                     csv_rows.append({
                         "id": row_i.get("id", processed),
@@ -1476,43 +1650,136 @@ class App(ctk.CTk):
                         "tier2_toxic": t2,
                         "tier3_labels": t3,
                     })
+
                     rid = row_i.get("id", processed)
                     dt = str(row_i.get("text", "")).replace("\n", "  ")[:80]
                     self.after(0, lambda r=rid, d=dt, s1=t1, s2=t2, s3=t3:
                                self.lbl_tree.insert("", "end", values=(r, d, s1, s2, s3)))
-                pd.DataFrame(csv_rows).to_csv(labeled_path, mode="a", header=not file_exists, index=False, encoding="utf-8-sig")
-                file_exists = True
-                p = processed / total
+
+                if csv_rows:
+                    pd.DataFrame(csv_rows).to_csv(
+                        labeled_path,
+                        mode="a",
+                        header=not file_exists,
+                        index=False,
+                        encoding="utf-8-sig",
+                    )
+                    file_exists = True
+
+                p = (processed / total) if total else 0
                 pc = processed
                 self.after(0, lambda v=p: self.lbl_progress.set(v))
                 self.after(0, lambda v=pc, t=total: self.lbl_progress_text.configure(text=f"{v} / {t}"))
                 stats_str = " | ".join(f"{k}: {v}" for k, v in label_counts.items())
                 self.after(0, self._lbl_log, f"   ✓ Batch xong. [{stats_str}]")
 
-            try:
+            def _split_batches():
+                batches = []
+                buf_rows = []
+                buf_tasks = []
                 for row in pending_rows:
                     if self._lbl_stop_event.is_set():
-                        self.after(0, self._lbl_log, "🛑 Đã nhận lệnh DỪNG. Dữ liệu đã gán được lưu.")
                         break
-                    buffer_rows.append(row)
-                    buffer_tasks.append({"data": {"text": str(row.get("text", ""))}})
-                    if len(buffer_tasks) < batch_size:
-                        continue
-                    self.after(0, self._lbl_log, f"📤 Gửi batch {processed + 1}–{processed + len(buffer_tasks)} / {total} ...")
-                    _flush_batch()
-                    buffer_rows.clear()
-                    buffer_tasks.clear()
-                if buffer_tasks and not self._lbl_stop_event.is_set():
-                    self.after(0, self._lbl_log, f"📤 Gửi batch cuối {processed + 1}–{processed + len(buffer_tasks)} / {total} ...")
-                    _flush_batch()
+                    buf_rows.append(row)
+                    buf_tasks.append({"data": {"text": str(row.get("text", ""))}})
+                    if len(buf_tasks) >= batch_size:
+                        batches.append((buf_rows, buf_tasks))
+                        buf_rows = []
+                        buf_tasks = []
+                if buf_tasks and not self._lbl_stop_event.is_set():
+                    batches.append((buf_rows, buf_tasks))
+                return batches
+
+            try:
+                batches = _split_batches()
+                if self._lbl_stop_event.is_set():
+                    self.after(0, self._lbl_log, "🛑 Đã nhận lệnh DỪNG. Dữ liệu đã gán được lưu.")
+
+                if workers <= 1:
+                    # Sequential (backward compatible)
+                    for i, (batch_rows, batch_tasks) in enumerate(batches):
+                        if self._lbl_stop_event.is_set():
+                            self.after(0, self._lbl_log, "🛑 Đã nhận lệnh DỪNG. Dữ liệu đã gán được lưu.")
+                            break
+                        self.after(
+                            0,
+                            self._lbl_log,
+                            f"📤 Gửi batch {i + 1}/{len(batches)} (n={len(batch_tasks)}) ...",
+                        )
+                        predictions = classifier_single.predict(batch_tasks, retries=request_retries)
+                        if not isinstance(predictions, list) or len(predictions) != len(batch_tasks):
+                            predictions = [_default_result() for _ in batch_tasks]
+                        _write_batch_results(batch_rows, predictions)
+                else:
+                    # Concurrent: keep ordered writes/UI updates, but run predict() in parallel.
+                    thread_local = threading.local()
+
+                    def _predict_batch(batch_tasks):
+                        clf = getattr(thread_local, "classifier", None)
+                        if clf is None:
+                            clf = _make_classifier()
+                            thread_local.classifier = clf
+                        return clf.predict(batch_tasks, retries=request_retries)
+
+                    max_inflight = max(1, min(len(batches), workers * 2))
+                    inflight: dict[int, concurrent.futures.Future] = {}
+                    next_to_write = 0
+                    next_to_submit = 0
+
+                    ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+                    try:
+                        while next_to_write < len(batches):
+                            if self._lbl_stop_event.is_set():
+                                self.after(0, self._lbl_log, "🛑 Đã nhận lệnh DỪNG. Đang hủy các batch còn lại...")
+                                break
+
+                            while (not self._lbl_stop_event.is_set()) and next_to_submit < len(batches) and len(inflight) < max_inflight:
+                                batch_rows, batch_tasks = batches[next_to_submit]
+                                self.after(
+                                    0,
+                                    self._lbl_log,
+                                    f"📤 (Song song) Submit batch {next_to_submit + 1}/{len(batches)} (n={len(batch_tasks)}) ...",
+                                )
+                                inflight[next_to_submit] = ex.submit(_predict_batch, batch_tasks)
+                                next_to_submit += 1
+
+                            fut = inflight.get(next_to_write)
+                            if fut is None:
+                                break
+
+                            batch_rows, batch_tasks = batches[next_to_write]
+                            try:
+                                predictions = fut.result()
+                            except Exception:
+                                predictions = [_default_result() for _ in batch_tasks]
+
+                            inflight.pop(next_to_write, None)
+                            if not isinstance(predictions, list) or len(predictions) != len(batch_tasks):
+                                predictions = [_default_result() for _ in batch_tasks]
+
+                            _write_batch_results(batch_rows, predictions)
+                            next_to_write += 1
+                    finally:
+                        ex.shutdown(wait=not self._lbl_stop_event.is_set(), cancel_futures=True)
+
                 newly_labeled = processed - skipped
-                self.after(0, self._lbl_log, "\n" + "=" * 50)
-                self.after(0, self._lbl_log, f"✅ HOÀN TẤT: {processed}/{total} bình luận đã gán nhãn ({newly_labeled} mới gán)")
-                for lbl, cnt in label_counts.items():
-                    self.after(0, self._lbl_log, f"   {lbl}: {cnt}")
-                self.after(0, self._lbl_log, f"📂 Đã lưu: {labeled_path}")
-                final_msg = f"✅ Hoàn tất — {processed}/{total} dòng đã gán nhãn ({newly_labeled} mới) → labeled_data.csv"
-                self.after(0, lambda: self.lbl_status_label.configure(text=final_msg, text_color="green"))
+                if self._lbl_stop_event.is_set():
+                    self.after(0, self._lbl_log, "\n" + "=" * 50)
+                    self.after(0, self._lbl_log, f"🛑 ĐÃ DỪNG: {processed}/{total} bình luận đã được lưu ({newly_labeled} mới gán)")
+                    stats_str = " | ".join(f"{k}: {v}" for k, v in label_counts.items())
+                    if stats_str:
+                        self.after(0, self._lbl_log, f"   Thống kê: [{stats_str}]")
+                    self.after(0, self._lbl_log, f"📂 Đã lưu: {labeled_path}")
+                    stop_msg = f"🛑 Đã dừng — {processed}/{total} dòng đã lưu"
+                    self.after(0, lambda: self.lbl_status_label.configure(text=stop_msg, text_color="orange"))
+                else:
+                    self.after(0, self._lbl_log, "\n" + "=" * 50)
+                    self.after(0, self._lbl_log, f"✅ HOÀN TẤT: {processed}/{total} bình luận đã gán nhãn ({newly_labeled} mới gán)")
+                    for lbl, cnt in label_counts.items():
+                        self.after(0, self._lbl_log, f"   {lbl}: {cnt}")
+                    self.after(0, self._lbl_log, f"📂 Đã lưu: {labeled_path}")
+                    final_msg = f"✅ Hoàn tất — {processed}/{total} dòng đã gán nhãn ({newly_labeled} mới) → labeled_data.csv"
+                    self.after(0, lambda: self.lbl_status_label.configure(text=final_msg, text_color="green"))
             except Exception as e:
                 err_msg = str(e)
                 self.after(0, self._lbl_log, f"❌ Lỗi: {err_msg}")
@@ -1672,29 +1939,56 @@ class App(ctk.CTk):
         self._lm_all_rows = []
         if os.path.isfile(labeled_path):
             try:
-                with open(labeled_path, "r", encoding="utf-8-sig") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        # New 3-tier format
-                        if "tier1_spam" in row:
-                            self._lm_all_rows.append({
-                                "id": row.get("id", ""),
-                                "text": row.get("text", ""),
-                                "tier1_spam": row.get("tier1_spam", "Not Spam"),
-                                "tier2_toxic": row.get("tier2_toxic", "Clean"),
-                                "tier3_labels": row.get("tier3_labels", ""),
-                            })
-                        else:
-                            # Backward compatibility: migrate old format (id, text, label)
-                            old_label = row.get("label", "Clean")
-                            t1, t2, t3 = self._migrate_old_label(old_label)
-                            self._lm_all_rows.append({
-                                "id": row.get("id", ""),
-                                "text": row.get("text", ""),
-                                "tier1_spam": t1,
-                                "tier2_toxic": t2,
-                                "tier3_labels": t3,
-                            })
+                raw_rows, fieldnames, enc_used = self._read_csv_dicts_with_fallback(labeled_path)
+                # Auto-convert only when we are reasonably confident (cp1258/cp1252).
+                # Avoid destructive conversions from latin-1 or utf-8(replace).
+                if enc_used in ("cp1258", "cp1252"):
+                    bak = self._backup_file(labeled_path)
+                    self._rewrite_csv_utf8sig(labeled_path, raw_rows, fieldnames)
+                    self.lm_status_label.configure(text=f"Đã sửa encoding (backup: {os.path.basename(bak)})", text_color="orange")
+                    raw_rows, fieldnames, enc_used = self._read_csv_dicts_with_fallback(labeled_path)
+
+                # If file content looks like mojibake (double-encoded), repair once.
+                need_repair = False
+                for r in raw_rows[:200]:
+                    if not isinstance(r, dict):
+                        continue
+                    for v in r.values():
+                        if isinstance(v, str) and self._looks_mojibake(v):
+                            need_repair = True
+                            break
+                    if need_repair:
+                        break
+
+                if need_repair:
+                    bak = self._backup_file(labeled_path)
+                    self._rewrite_csv_utf8sig(labeled_path, raw_rows, fieldnames)
+                    self.lm_status_label.configure(text=f"Đã repair chữ Việt (backup: {os.path.basename(bak)})", text_color="orange")
+                    raw_rows, fieldnames, enc_used = self._read_csv_dicts_with_fallback(labeled_path)
+
+                for row in raw_rows:
+                    if isinstance(row, dict):
+                        row = self._sanitize_csv_row(row)
+                    # New 3-tier format
+                    if "tier1_spam" in row:
+                        self._lm_all_rows.append({
+                            "id": row.get("id", ""),
+                            "text": row.get("text", ""),
+                            "tier1_spam": row.get("tier1_spam", "Not Spam"),
+                            "tier2_toxic": row.get("tier2_toxic", "Clean"),
+                            "tier3_labels": row.get("tier3_labels", ""),
+                        })
+                    else:
+                        # Backward compatibility: migrate old format (id, text, label)
+                        old_label = row.get("label", "Clean")
+                        t1, t2, t3 = self._migrate_old_label(str(old_label))
+                        self._lm_all_rows.append({
+                            "id": row.get("id", ""),
+                            "text": row.get("text", ""),
+                            "tier1_spam": t1,
+                            "tier2_toxic": t2,
+                            "tier3_labels": t3,
+                        })
             except Exception as e:
                 messagebox.showerror("Lỗi", f"Không thể đọc labeled_data.csv: {e}")
         self._lm_display_rows(self._lm_all_rows)

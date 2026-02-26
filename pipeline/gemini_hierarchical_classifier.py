@@ -26,6 +26,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+import random
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -49,8 +51,9 @@ Classify as exactly one of: "Spam" or "Not Spam".
 
 ### Tier 2 – Toxic Check (INDEPENDENT from Tier 1)
 Classify as exactly one of: "Toxic" or "Clean".
-- "Toxic": contains harmful, offensive, or inappropriate content.
-- "Clean": normal, non-harmful content.
+"Toxic": content that includes insults, harassment, threats, profanity, or hate speech targeting a person or group.
+"Toxic" requires abusive or aggressive intent.
+"Clean": criticism, negative opinions, or complaints without insults or abusive language.
 IMPORTANT: A comment can be both "Spam" AND "Toxic", or "Spam" AND "Clean". Tier 1 and Tier 2 are independent.
 
 ### Tier 3 – Multi-label (DEPENDS on Tier 2)
@@ -71,6 +74,15 @@ Reply with ONLY a JSON object with this exact shape:
   {"tier1_spam": "Spam"|"Not Spam", "tier2_toxic": "Toxic"|"Clean", "tier3_labels": ["...", ...]},
   ...
 ]}
+
+General Rules:
+- Evaluate tiers independently but logically consistent.
+- If Tier 2 = "Toxic", Tier 3 MUST contain at least one toxic label.
+- If Tier 2 = "Clean", Tier 3 MUST contain at least one clean label.
+- Toxic classification overrides sentiment classification.
+- Do not classify something as Spam based only on being short.
+- Criticism without insult = Clean + Negative.
+- Profanity automatically qualifies as Obscene (Toxic).
 
 - "items" must be an array with one object per input comment, in the same order.
 - Do NOT add any explanation, numbering, markdown, or extra text outside the JSON."""
@@ -194,11 +206,41 @@ class GeminiHierarchicalClassifier:
             ],
         }
 
+        def _retry_sleep_seconds(attempt_index: int, response: requests.Response | None) -> float:
+            # attempt_index is 0-based (0 = first failure)
+            retry_after = None
+            if response is not None:
+                try:
+                    ra = response.headers.get("Retry-After")
+                    if ra:
+                        retry_after = float(ra)
+                except Exception:
+                    retry_after = None
+
+            # Exponential backoff with jitter; keep it bounded to avoid long stalls.
+            base = min(8.0, 1.0 * (2 ** min(attempt_index, 5)))  # 1,2,4,8,8,...
+            jitter = random.uniform(0.0, 0.35 * base)
+            delay = base + jitter
+            if retry_after is not None:
+                delay = max(delay, retry_after)
+            return min(delay, 15.0)
+
+        def _is_retryable_http(status_code: int) -> bool:
+            return status_code in (408, 429, 500, 502, 503, 504)
+
         last_error: Exception | None = None
-        for attempt in range(1 + retries):
+        last_response: requests.Response | None = None
+        for attempt in range(1 + max(0, int(retries))):
             try:
                 r = self.session.post(self.endpoint, json=payload, timeout=self.timeout)
-                r.raise_for_status()
+                last_response = r
+                if r.status_code >= 400:
+                    # Retryable errors: rate-limit / transient server issues.
+                    if _is_retryable_http(int(r.status_code)) and attempt < retries:
+                        time.sleep(_retry_sleep_seconds(attempt, r))
+                        continue
+                    r.raise_for_status()
+
                 data = r.json()
                 text = _get_gemini_text(data)
                 items = _parse_items(text, expected_n=len(tasks))
@@ -207,10 +249,16 @@ class GeminiHierarchicalClassifier:
                 if len(validated) == len(tasks):
                     return validated
 
+                # Parsed but shape mismatch → treat as retryable parsing failure.
+                raise ValueError("Gemini output parse mismatch")
+
             except Exception as e:
                 last_error = e
-                if attempt == retries:
-                    break
+                # If we hit a retryable case (timeouts, connection issues, parse mismatch), backoff.
+                if attempt < retries:
+                    time.sleep(_retry_sleep_seconds(attempt, last_response))
+                    continue
+                break
 
         _ = last_error
         return [_default_result() for _ in range(len(tasks))]
