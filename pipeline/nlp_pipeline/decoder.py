@@ -17,9 +17,12 @@ _IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 # --- Threads-specific artifact patterns (safety net for NLP pipeline) ---
 # Trailing "Translate" / "Dịch" button text stuck to comment
 _TRAILING_TRANSLATE = re.compile(r"(?:[Tt]ranslate|Dịch)\s*$")
-# "gia đình" repeated anomaly from emoji <img alt="gia đình"> leak
-_GIA_DINH_SPAM = re.compile(r"(?:\s*gia đình\s*){2,}:?")
-_GIA_DINH_NEAR_EMOJI = re.compile(r"\s*gia đình\s*:?\s*(?=:|$)")
+# "gia đình" repeated anomaly from emoji <img alt="gia đình"> leak.
+# Some crawlers/UI layers may convert whitespace to underscores early, so handle both
+# "gia đình" and "gia_đình" (case-insensitive).
+_GIA_DINH_WORD = r"gia(?:\s+|_)+đình"
+_GIA_DINH_SPAM = re.compile(rf"(?:\s*{_GIA_DINH_WORD}\s*){{2,}}:?", re.IGNORECASE)
+_GIA_DINH_NEAR_EMOJI = re.compile(rf"\s*{_GIA_DINH_WORD}\s*:?(?=:|$)", re.IGNORECASE)
 
 
 class Decoder:
@@ -101,13 +104,13 @@ class Decoder:
             # Sad: =(( =((( 
             (re.compile(r"(=\({2,})"), "=(", "("),
             # Pacman: :v :V (no truncation)
-            (re.compile(r"(:(?:v|V))"), ":v", None),
+            (re.compile(r"(:(?:v|V))(?!:)"), ":v", None),
             # Cute: :3 (no truncation)
-            (re.compile(r"(:3)"), ":3", None),
+            (re.compile(r"(:3)(?!:)"), ":3", None),
             # Big grin: :D :DD
             (re.compile(r"(:D{2,})"), ":D", "D"),
             # Tongue: :P :p (no truncation)
-            (re.compile(r"(:(?:P|p))"), ":P", None),
+            (re.compile(r"(:(?:P|p))(?!:)"), ":P", None),
         ]
 
         # Literal text emoticons: fixed string → token
@@ -136,6 +139,18 @@ class Decoder:
         """
         # 1. Literal emoticons (fixed substitution)
         for pattern, token in self._literal_emoticons:
+            text = pattern.sub(f" {token} ", text)
+
+        # 1.5 Protect fixed-form emoticons that shouldn't be truncated.
+        # Convert them into :token: form so later normalizer steps (e.g. abbreviations)
+        # cannot rewrite their inner text (e.g. ":v" -> ":vậy").
+        for pattern, base, repeat_char in self._icon_patterns:
+            if repeat_char is not None:
+                continue
+
+            token = (base or "").strip()
+            if token.startswith(":") and not token.endswith(":"):
+                token = token.lower() + ":"
             text = pattern.sub(f" {token} ", text)
 
         # 2. Repeated-char truncation (:))))  → :)))  etc.)

@@ -10,6 +10,7 @@ import math
 from typing import Optional, List, Dict
 
 _lock = threading.Lock()
+_raw_lock = threading.Lock()
 
 
 CLUSTER_SIZE_DEFAULT = 25_000
@@ -17,6 +18,15 @@ CLUSTER_SIZE_DEFAULT = 25_000
 def _default_path() -> str:
     """Default warehouse path: pipeline/warehouse.csv (one level up from nlp_pipeline/)."""
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "warehouse.csv")
+
+
+def _default_raw_path() -> str:
+    """Default raw warehouse path: pipeline/warehouse_raw.csv.
+
+    This file stores the original (non-NLP-processed) text that has only passed
+    the Filter stage.
+    """
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "warehouse_raw.csv")
 
 
 def _get_max_id(warehouse_path: str) -> int:
@@ -65,6 +75,40 @@ def append_to_warehouse(rows: list, warehouse_path: str = None) -> int:
         start_id = _get_max_id(warehouse_path) + 1
 
         with open(warehouse_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["id", "text"])
+            if not file_exists:
+                writer.writeheader()
+            for i, row in enumerate(rows):
+                writer.writerow({"id": start_id + i, "text": row.get("text", "")})
+
+    return len(rows)
+
+
+def append_to_raw_warehouse(rows: list, raw_warehouse_path: str | None = None) -> int:
+    """Append rows to warehouse_raw.csv.
+
+    Parameters
+    ----------
+    rows : list[dict]
+        Each dict must have key ``"text"``.
+    raw_warehouse_path : str, optional
+        Path to the raw warehouse CSV. Defaults to ``pipeline/warehouse_raw.csv``.
+
+    Returns
+    -------
+    int
+        Number of rows actually written.
+    """
+    if not rows:
+        return 0
+
+    raw_warehouse_path = raw_warehouse_path or _default_raw_path()
+
+    with _raw_lock:
+        file_exists = os.path.isfile(raw_warehouse_path)
+        start_id = _get_max_id(raw_warehouse_path) + 1
+
+        with open(raw_warehouse_path, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["id", "text"])
             if not file_exists:
                 writer.writeheader()

@@ -20,10 +20,35 @@ _CANON_PLACEHOLDER_RE = re.compile(
 )
 
 
+_EMOJI_TOKEN_SPACED_RE = re.compile(
+    r":\s*(?P<name>[a-zA-Z0-9_àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]+(?:\s*_\s*[a-zA-Z0-9_àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]+)*)\s*:",
+    re.UNICODE | re.IGNORECASE,
+)
+
+
 def _canonicalize_placeholders(text: str) -> str:
     if not text:
         return text
     return _CANON_PLACEHOLDER_RE.sub(lambda m: f"<{m.group(1).upper()}>", text)
+
+
+def _canonicalize_emoji_tokens(text: str) -> str:
+    """Normalize spaced/broken emoji tokens back to :name_with_underscores:.
+
+    This is a safety net for historical data (e.g. existing warehouse rows) or
+    for any tokenizer that might insert spaces around ':' / '_' and break tokens
+    like ": mặt _ tan _ chảy :".
+    """
+
+    if not text:
+        return text
+
+    def _fix(m: re.Match) -> str:
+        name = m.group("name")
+        name = re.sub(r"\s*_\s*", "_", name.strip())
+        return f":{name}:"
+
+    return _EMOJI_TOKEN_SPACED_RE.sub(_fix, text)
 
 class VietnameseCommentPreprocessor:
     def __init__(
@@ -152,6 +177,9 @@ class VietnameseCommentPreprocessor:
             except Exception as e:
                 # If segment fails, just use the non-segmented text to avoid data loss
                 pass
+
+        # 4.5 Safety-net: re-join emoji tokens if a backend split them
+        current_text = _canonicalize_emoji_tokens(current_text)
 
         # 5. Canonicalize placeholder tags (AFTER segmentation)
         current_text = _canonicalize_placeholders(current_text)

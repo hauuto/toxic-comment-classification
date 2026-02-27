@@ -114,7 +114,8 @@ def _detect_chrome_major_version() -> int | None:
     return None
 
 from nlp_pipeline import VietnameseCommentPreprocessor
-from nlp_pipeline.warehouse import append_to_warehouse
+from nlp_pipeline.filter import Filter
+from nlp_pipeline.warehouse import append_to_warehouse, append_to_raw_warehouse
 
 load_dotenv()
 
@@ -293,7 +294,11 @@ def extract_youtube_comments(
     url_or_id: str, *, log_callback=None, data_callback=None, stop_event=None,
     preprocessor=None, use_decoder: bool = True, use_filter: bool = True,
     use_normalizer: bool = True, use_segmentor: bool = True,
-    current_id: int = 1, seen_texts: set = None, extracted_data: list = None,
+    current_id: int = 1,
+    seen_texts: set = None,
+    seen_raw_texts: set = None,
+    raw_filter: Filter | None = None,
+    extracted_data: list = None,
 ) -> int:
     """Fetch all comments for a YouTube video via the Data API v3."""
     def log(msg):
@@ -301,6 +306,7 @@ def extract_youtube_comments(
         else: print(msg)
 
     if seen_texts is None: seen_texts = set()
+    if seen_raw_texts is None: seen_raw_texts = set()
     if extracted_data is None: extracted_data = []
 
     video_id = _extract_video_id(url_or_id)
@@ -347,12 +353,25 @@ def extract_youtube_comments(
         if not items: break
 
         new_batch = []
+        raw_rows = []
         for item in items:
             if stop_event and stop_event.is_set(): break
             snippet = item["snippet"]["topLevelComment"]["snippet"]
             full_text = snippet.get("textDisplay", "").strip()
             if not full_text or (len(full_text) < 2 and full_text not in ["Ok", "Dạ"]):
                 continue
+
+            # Write raw (filter-only) text to raw warehouse.
+            # This is independent of decoder/normalizer/segmentor settings.
+            try:
+                f = raw_filter or Filter()
+                keep_raw, _ = f.filter_comment(full_text, raw_text=full_text)
+            except Exception:
+                keep_raw = False
+            if keep_raw and full_text not in seen_raw_texts:
+                seen_raw_texts.add(full_text)
+                raw_rows.append({"text": full_text})
+
             if preprocessor:
                 processed = preprocessor.process_comment(full_text, use_decoder=use_decoder, use_filter=use_filter, use_normalizer=use_normalizer, use_segmentor=use_segmentor)
                 if not processed["is_valid"]: continue
@@ -363,6 +382,12 @@ def extract_youtube_comments(
                 seen_texts.add(clean_text)
                 row = {"id": current_id, "text": clean_text}
                 new_batch.append(row); extracted_data.append(row); current_id += 1
+
+        if raw_rows:
+            try:
+                append_to_raw_warehouse(raw_rows)
+            except Exception:
+                pass
 
         if new_batch:
             total_fetched += len(new_batch)
@@ -380,7 +405,7 @@ def extract_youtube_comments(
 #  Playwright URL crawlers (Facebook, TikTok, Threads-URL)
 # =========================================================================== #
 
-def _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback):
+def _extract_facebook(page, log, current_id, seen_texts, seen_raw_texts, raw_filter, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback):
     log("Đợi trang ổn định...")
     time.sleep(5)
     
@@ -460,6 +485,7 @@ def _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocesso
         count = comment_articles.count()
         
         new_batch = []
+        raw_rows = []
         start_idx = 1 if count > 0 else 0
         
         for i in range(start_idx, count):
@@ -477,6 +503,15 @@ def _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocesso
                 
                 if not full_text: continue
                 if len(full_text) < 2 and full_text not in ['Ok', 'Dạ']: continue
+
+                # Raw (filter-only) output
+                try:
+                    keep_raw, _ = (raw_filter or Filter()).filter_comment(full_text, raw_text=full_text)
+                except Exception:
+                    keep_raw = False
+                if keep_raw and full_text not in seen_raw_texts:
+                    seen_raw_texts.add(full_text)
+                    raw_rows.append({"text": full_text})
                      
                 if preprocessor:
                     processed = preprocessor.process_comment(full_text, use_decoder=use_decoder, use_filter=use_filter, use_normalizer=use_normalizer, use_segmentor=use_segmentor)
@@ -491,6 +526,12 @@ def _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocesso
                     new_batch.append(item)
                     extracted_data.append(item)
                     current_id += 1
+            except Exception:
+                pass
+
+        if raw_rows:
+            try:
+                append_to_raw_warehouse(raw_rows)
             except Exception:
                 pass
         
@@ -508,7 +549,7 @@ def _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocesso
         time.sleep(2)
     return current_id
 
-def _extract_tiktok(page, log, current_id, seen_texts, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback):
+def _extract_tiktok(page, log, current_id, seen_texts, seen_raw_texts, raw_filter, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback):
     log("Đợi trang ổn định TikTok...")
     time.sleep(5)
     
@@ -595,11 +636,21 @@ def _extract_tiktok(page, log, current_id, seen_texts, stop_event, preprocessor,
         
         raw_comments = page.evaluate(extract_comments_js)
         new_batch = []
+        raw_rows = []
         
         for full_text in raw_comments:
             try:
                 if not full_text: continue
                 if len(full_text) < 2 and full_text not in ['Ok', 'Dạ']: continue
+
+                # Raw (filter-only) output
+                try:
+                    keep_raw, _ = (raw_filter or Filter()).filter_comment(full_text, raw_text=full_text)
+                except Exception:
+                    keep_raw = False
+                if keep_raw and full_text not in seen_raw_texts:
+                    seen_raw_texts.add(full_text)
+                    raw_rows.append({"text": full_text})
                 
                 if preprocessor:
                     processed = preprocessor.process_comment(full_text, use_decoder=use_decoder, use_filter=use_filter, use_normalizer=use_normalizer, use_segmentor=use_segmentor)
@@ -614,6 +665,12 @@ def _extract_tiktok(page, log, current_id, seen_texts, stop_event, preprocessor,
                     new_batch.append(item)
                     extracted_data.append(item)
                     current_id += 1
+            except Exception:
+                pass
+
+        if raw_rows:
+            try:
+                append_to_raw_warehouse(raw_rows)
             except Exception:
                 pass
                 
@@ -631,7 +688,7 @@ def _extract_tiktok(page, log, current_id, seen_texts, stop_event, preprocessor,
         time.sleep(2)
     return current_id
 
-def _extract_threads(page, log, current_id, seen_texts, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback):
+def _extract_threads(page, log, current_id, seen_texts, seen_raw_texts, raw_filter, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback):
     log("Đợi trang ổn định Threads...")
     time.sleep(5)
     
@@ -702,6 +759,7 @@ def _extract_threads(page, log, current_id, seen_texts, stop_event, preprocessor
             comment_blocks = page.locator('span[dir="auto"], div[dir="auto"]')
             count = comment_blocks.count()
         new_batch = []
+        raw_rows = []
         
         for i in range(count):
             try:
@@ -717,6 +775,15 @@ def _extract_threads(page, log, current_id, seen_texts, stop_event, preprocessor
                 if len(full_text) < 2 and full_text not in ['Ok', 'Dạ']:
                     continue
 
+                # Raw (filter-only) output
+                try:
+                    keep_raw, _ = (raw_filter or Filter()).filter_comment(full_text, raw_text=full_text)
+                except Exception:
+                    keep_raw = False
+                if keep_raw and full_text not in seen_raw_texts:
+                    seen_raw_texts.add(full_text)
+                    raw_rows.append({"text": full_text})
+
                 if preprocessor:
                     processed = preprocessor.process_comment(full_text, use_decoder=use_decoder, use_filter=use_filter, use_normalizer=use_normalizer, use_segmentor=use_segmentor)
                     if not processed["is_valid"]: continue
@@ -730,6 +797,12 @@ def _extract_threads(page, log, current_id, seen_texts, stop_event, preprocessor
                     new_batch.append(item)
                     extracted_data.append(item)
                     current_id += 1
+            except Exception:
+                pass
+
+        if raw_rows:
+            try:
+                append_to_raw_warehouse(raw_rows)
             except Exception:
                 pass
                 
@@ -773,6 +846,7 @@ def extract_comments_stream(url_input: str, headless: bool = False,
     
     extracted_data = [] # Full history (optional, callbacks usually handle the main data)
     seen_texts = set()
+    seen_raw_texts = set()
     current_id = 1
     
     try:
@@ -782,6 +856,9 @@ def extract_comments_stream(url_input: str, headless: bool = False,
                 preprocessor = VietnameseCommentPreprocessor(segmentor_backend=segmentor_backend)
             else:
                 preprocessor = None
+
+        # Raw (filter-only) output should always be available, even if NLP is disabled.
+        raw_filter = preprocessor.filter if preprocessor is not None else Filter()
             
         with sync_playwright() as p:
             log("Mở trình duyệt...")
@@ -814,6 +891,8 @@ def extract_comments_stream(url_input: str, headless: bool = False,
                         use_segmentor=use_segmentor,
                         current_id=current_id,
                         seen_texts=seen_texts,
+                        seen_raw_texts=seen_raw_texts,
+                        raw_filter=raw_filter,
                         extracted_data=extracted_data,
                     )
                     log(f"--- Hoàn tất trang {url} ---")
@@ -831,11 +910,11 @@ def extract_comments_stream(url_input: str, headless: bool = False,
                 try:
                     # Auto-detect platform
                     if "facebook.com" in url_lower or "fb.com" in url_lower or "fb.watch" in url_lower:
-                        current_id = _extract_facebook(page, log, current_id, seen_texts, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback)
+                        current_id = _extract_facebook(page, log, current_id, seen_texts, seen_raw_texts, raw_filter, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback)
                     elif "tiktok.com" in url_lower:
-                        current_id = _extract_tiktok(page, log, current_id, seen_texts, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback)
+                        current_id = _extract_tiktok(page, log, current_id, seen_texts, seen_raw_texts, raw_filter, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback)
                     elif "threads.net" in url_lower or "threads.com" in url_lower:
-                        current_id = _extract_threads(page, log, current_id, seen_texts, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback)
+                        current_id = _extract_threads(page, log, current_id, seen_texts, seen_raw_texts, raw_filter, stop_event, preprocessor, use_decoder, use_filter, use_normalizer, use_segmentor, extracted_data, data_callback)
                     else:
                         log(f"Nền tảng không được hỗ trợ (chỉ FB, YT, TikTok, Threads): {url}")
                 except Exception as e:
@@ -1253,13 +1332,29 @@ class VOZCrawler:
         seen_lock = threading.Lock()
         all_texts_lock = threading.Lock()
 
+        seen_raw_texts: set = set()
+        seen_raw_lock = threading.Lock()
+        raw_filter = self.preprocessor.filter if self.preprocessor is not None else Filter()
+
         # Track how many threads succeeded via fast-path vs Selenium
         _stats = {"fast": 0, "selenium": 0, "failed": 0}
 
-        def _process_batch(raw_batch: List[str]) -> List[str]:
-            """NLP-preprocess a raw batch and deduplicate."""
+        def _process_batch(raw_batch: List[str]) -> tuple[List[str], list[dict]]:
+            """NLP-preprocess a raw batch and also collect raw(filter-only) rows."""
             processed: List[str] = []
+            raw_rows: list[dict] = []
             for text in raw_batch:
+                # Raw (filter-only) output
+                try:
+                    keep_raw, _ = raw_filter.filter_comment(text, raw_text=text)
+                except Exception:
+                    keep_raw = False
+                if keep_raw:
+                    with seen_raw_lock:
+                        if text not in seen_raw_texts:
+                            seen_raw_texts.add(text)
+                            raw_rows.append({"text": text})
+
                 if self.preprocessor:
                     result = self.preprocessor.process_comment(
                         text,
@@ -1278,7 +1373,7 @@ class VOZCrawler:
                         if clean not in seen_texts:
                             seen_texts.add(clean)
                             processed.append(clean)
-            return processed
+            return processed, raw_rows
 
         _MAX_RETRIES = 2
 
@@ -1316,7 +1411,15 @@ class VOZCrawler:
                         _stats["failed"] += 1
                         return
 
-                    processed_batch = _process_batch(raw_batch)
+                    processed_batch, raw_rows = _process_batch(raw_batch)
+
+                    if raw_rows:
+                        try:
+                            raw_count = append_to_raw_warehouse(raw_rows)
+                            self._log(f"    [WAREHOUSE_RAW] +{raw_count} dòng (w{worker_id})")
+                        except Exception:
+                            pass
+
                     if processed_batch:
                         with all_texts_lock:
                             start_idx = len(all_texts) + 1
@@ -1672,6 +1775,8 @@ class ThreadsCrawler:
 
         all_texts: List[str] = []
         seen_texts: set = set()
+        seen_raw_texts: set = set()
+        raw_filter = self.preprocessor.filter if self.preprocessor is not None else Filter()
 
         for i, url in enumerate(urls):
             if self._stopped():
@@ -1686,7 +1791,17 @@ class ThreadsCrawler:
                     raise WebDriverException("Zero data returned")
 
                 processed_batch: List[str] = []
+                raw_rows: list[dict] = []
                 for text in raw_batch:
+                    # Raw (filter-only) output
+                    try:
+                        keep_raw, _ = raw_filter.filter_comment(text, raw_text=text)
+                    except Exception:
+                        keep_raw = False
+                    if keep_raw and text not in seen_raw_texts:
+                        seen_raw_texts.add(text)
+                        raw_rows.append({"text": text})
+
                     if self.preprocessor:
                         result = self.preprocessor.process_comment(
                             text, use_decoder=self.use_decoder, use_filter=self.use_filter,
@@ -1699,6 +1814,13 @@ class ThreadsCrawler:
                     if clean and clean not in seen_texts:
                         seen_texts.add(clean)
                         processed_batch.append(clean)
+
+                if raw_rows:
+                    try:
+                        raw_count = append_to_raw_warehouse(raw_rows)
+                        self._log(f"    [WAREHOUSE_RAW] +{raw_count} dòng")
+                    except Exception:
+                        pass
 
                 if processed_batch:
                     all_texts.extend(processed_batch)

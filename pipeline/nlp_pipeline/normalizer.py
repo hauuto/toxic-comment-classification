@@ -13,7 +13,11 @@ import json
 import re
 import unicodedata
 from .config import MAX_REPEAT_CHARS, MAX_REPEAT_PUNCTUATION, VIA_SIGNATURES
-from underthesea import text_normalize
+
+try:
+    from underthesea import text_normalize as _underthesea_text_normalize
+except Exception:  # underthesea may be missing or unsupported on some Python versions
+    _underthesea_text_normalize = None
 
 
 class Normalizer:
@@ -150,10 +154,25 @@ class Normalizer:
         # Placeholder protection: tokens like <url>, <mention>, <hashtag>, <email>,
         # <date>, <num> should not be split or lowercased internally.
         # We protect them by temporarily replacing with safe tokens during processing.
-        self._placeholder_pattern = re.compile(
-            r"<(?:url|mention|hashtag|email|date|time|num|ip)>",
-            re.IGNORECASE,
+        # Also protect emoji/icon tokens in the form :token: so abbreviation expansion
+        # cannot rewrite inside them (e.g. ":v:" should NOT become ":vậy:").
+        self._protected_token_pattern = re.compile(
+            r"<(?:url|mention|hashtag|email|date|time|num|ip)>|:[\w]+:",
+            re.IGNORECASE | re.UNICODE,
         )
+
+    def _protect_tokens(self, text: str):
+        tokens = {}
+        counter = [0]
+
+        def _protect(m):
+            key = f"xptx{counter[0]}xptx"  # already lowercase
+            tokens[key] = m.group()
+            counter[0] += 1
+            return key
+
+        protected = self._protected_token_pattern.sub(_protect, text)
+        return protected, tokens
 
     def normalize_char_elongation(self, text: str) -> str:
         """Reduce character elongation: hayyyyyyy → hayyy (max 3 repeats)."""
@@ -171,25 +190,21 @@ class Normalizer:
 
     def normalize_abbreviations(self, text: str) -> str:
         """Expand common Vietnamese abbreviations using word-boundary matching."""
+        protected, tokens = self._protect_tokens(text)
+
         def _replace(m):
             word = m.group(1)
             return self.abbrev_map.get(word.lower(), word)
-        return self._abbrev_pattern.sub(_replace, text)
+
+        out = self._abbrev_pattern.sub(_replace, protected)
+        for key, val in tokens.items():
+            out = out.replace(key, val)
+        return out
 
     def normalize_case(self, text: str) -> str:
         """Convert text to lowercase, preserving placeholder tokens."""
-        # Protect placeholders from lowercasing using unique lowercase markers
-        # (markers must be lowercase so they survive .lower() and can be found during restore)
-        placeholders = {}
-        counter = [0]
-
-        def _protect(m):
-            key = f"xphx{counter[0]}xphx"  # already lowercase
-            placeholders[key] = m.group()
-            counter[0] += 1
-            return key
-
-        protected = self._placeholder_pattern.sub(_protect, text)
+        # Protect placeholders/tokens from lowercasing using unique lowercase markers.
+        protected, placeholders = self._protect_tokens(text)
         lowered = protected.lower()
 
         # Restore original placeholders (markers survived lowercasing)
@@ -279,5 +294,6 @@ class Normalizer:
         text = self.normalize_case(text)
         text = self.normalize_abbreviations(text)
         text = self.normalize_whitespace(text)
-        text = text_normalize(text)
+        if _underthesea_text_normalize is not None:
+            text = _underthesea_text_normalize(text)
         return text
