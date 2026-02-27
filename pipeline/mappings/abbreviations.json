@@ -510,5 +510,8 @@
     "nói chung": [
         "nchung"
     ],
-    "gia đình": "gđ gd"
+    "gia đình": [
+        "gd",
+        "gđ"
+    ]
 }
