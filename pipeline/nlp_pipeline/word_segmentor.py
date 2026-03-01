@@ -248,7 +248,7 @@ class WordSegmentor:
                     # JVM is unresponsive — skip segmentation to keep pipeline moving
                     segmented = protected
                 else:
-                    future = _vncore_executor.submit(_model.annotate_text, _text)
+                    future = _vncore_executor.submit(_model.word_segment, _text)
                     try:
                         result = future.result(timeout=30)   # 30s per-row hard limit
                         self._vncore_timeout_streak = 0      # reset on success
@@ -261,13 +261,9 @@ class WordSegmentor:
                             print("[WordSegmentor] VnCoreNLP appears dead — "
                                   "falling back to whitespace for remaining rows")
                         return None
-                    tokens = []
 
-                    # result is dict: {sent_id: [word_info, ...]}
-                    for sentence in result.values():
-                        for word_info in sentence:
-                            tokens.append(word_info["wordForm"])
-                    segmented = " ".join(tokens)
+                    # word_segment returns List[str] — each element is a segmented sentence
+                    segmented = " ".join(result)
 
             # ---------- Underthesea ----------
             elif self.backend_name == "underthesea":

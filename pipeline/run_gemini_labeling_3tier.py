@@ -1,4 +1,4 @@
-"""run_gemini_labeling_3tier.py – Gán nhãn bình luận 3-tier bằng Gemini (Google AI Studio).
+"""run_gemini_labeling_3tier.py – Gán nhãn bình luận 2-tier bằng Gemini (Google AI Studio).
 
 Usage:
   python pipeline/run_gemini_labeling_3tier.py
@@ -69,7 +69,7 @@ def _load_existing_ids(output_path: str) -> set[int]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Labeling 3-tier với Gemini API (streaming)")
+    parser = argparse.ArgumentParser(description="Labeling 2-tier với Gemini API (streaming)")
     parser.add_argument("--input", default=os.path.join("pipeline", "warehouse.csv"))
     parser.add_argument("--id-col", default="id")
     parser.add_argument("--text-col", default="text")
@@ -120,7 +120,7 @@ def main() -> None:
         total_pending = total
 
     print("=" * 60)
-    print("🚀 BẮT ĐẦU PHÂN LOẠI (GEMINI - 3 TIER)")
+    print("🚀 BẮT ĐẦU PHÂN LOẠI (GEMINI - 2 TIER)")
     print(f"   - Model: {model}")
     print(f"   - Batch size: {batch_size}")
     print(f"   - Workers: {workers}")
@@ -131,21 +131,19 @@ def main() -> None:
     pbar = tqdm(total=total_pending, desc="Đang xử lý", unit=" dòng")
 
     def _default_result() -> Dict[str, Any]:
-        return {"tier1_spam": "Not Spam", "tier2_toxic": "Clean", "tier3_labels": ["Neutral"]}
+        return {"tier1_label": "Clean", "tier2_labels": ["Neutral"]}
 
     def _write_batch(batch_rows: List[Dict[str, Any]], preds: List[Dict[str, Any]]) -> None:
         nonlocal processed, file_exists
         rows_to_write = []
 
         for row_i, pred in zip(batch_rows, preds):
-            t1 = pred.get("tier1_spam", "Not Spam")
-            t2 = pred.get("tier2_toxic", "Clean")
-            t3_list = pred.get("tier3_labels", []) or []
-            t3 = "|".join(t3_list)
+            t1 = pred.get("tier1_label", "Clean")
+            t2_list = pred.get("tier2_labels", []) or []
+            t2 = "|".join(t2_list)
 
             label_counts[t1] = label_counts.get(t1, 0) + 1
-            label_counts[t2] = label_counts.get(t2, 0) + 1
-            for lbl in t3_list:
+            for lbl in t2_list:
                 label_counts[lbl] = label_counts.get(lbl, 0) + 1
 
             processed += 1
@@ -153,9 +151,8 @@ def main() -> None:
                 {
                     "id": row_i[args.id_col],
                     "text": row_i[args.text_col],
-                    "tier1_spam": t1,
-                    "tier2_toxic": t2,
-                    "tier3_labels": t3,
+                    "tier1_label": t1,
+                    "tier2_labels": t2,
                 }
             )
 

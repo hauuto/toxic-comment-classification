@@ -1,8 +1,9 @@
 """
 Standalone script – Chạy VnCoreNLP word segmentation trên warehouse.csv.
 
-Kiến trúc đơn giản: load VnCoreNLP trực tiếp trong process, xử lý tuần tự.
-Checkpoint mỗi 5000 dòng → nếu crash, chạy lại để tiếp tục.
+Kiến trúc: load VnCoreNLP trực tiếp trong process, xử lý theo batch (BATCH_SIZE=16).
+Dùng word_segment() thay vì annotate_text() — chỉ tách từ, bỏ POS/NER/dep parsing.
+Checkpoint mỗi batch → nếu crash, chạy lại để tiếp tục.
 
 Chạy:
     cd pipeline
@@ -24,7 +25,8 @@ CURRENT_PATH = os.path.join(SCRIPT_DIR, "warehouse_segmentation_current.txt")
 POISON_LOG_PATH = os.path.join(SCRIPT_DIR, "warehouse_segmentation_poison.txt")
 
 # ── Config ──
-SAVE_INTERVAL = 500   # save warehouse to disk every N rows
+BATCH_SIZE = 32       # number of rows per VnCoreNLP call
+SAVE_INTERVAL = 2000  # save warehouse to disk every N rows
 
 sys.path.insert(0, SCRIPT_DIR)
 
@@ -248,85 +250,129 @@ def main():
     model = py_vncorenlp.VnCoreNLP(save_dir=MODELS_DIR)
     print(f"       → VnCoreNLP sẵn sàng")
 
-    # 4. Process rows
-    print(f"[3/3] Tách từ ({total} dòng)...")
+    # 4. Pre-process: collect rows that need segmentation
+    print(f"[3/3] Tách từ ({total} dòng, batch_size={BATCH_SIZE})...")
     errors = 0
     skipped = 0
     poisoned = len(poison_rows)
     last_i = resume_from
     t0 = time.perf_counter()
 
-    try:
-        for i, row in enumerate(rows):
-            if i <= resume_from:
-                continue
+    # Sentinel marker to separate rows within a batch.
+    # VnCoreNLP may insert spaces, so we match with regex later.
+    SENTINEL = "XSEPX"
+    _SENTINEL_RE = re.compile(r"\s*X\s*S\s*E\s*P\s*X\s*")
 
-            last_i = i
-            text = row.get("text", "")
-            if not text or not text.strip():
-                continue
+    # Build list of (index, row) that need processing
+    work_items = []
+    for i, row in enumerate(rows):
+        if i <= resume_from:
+            continue
+        text = row.get("text", "")
+        if not text or not text.strip():
+            continue
+        if i in poison_rows:
+            skipped += 1
+            continue
+        sanitized = _sanitize_text(text)
+        if not sanitized.strip():
+            skipped += 1
+            continue
+        work_items.append((i, row, sanitized))
 
-            # Skip poison rows
-            if i in poison_rows:
-                skipped += 1
-                continue
+    # ── Helper: process a single row (fallback) ──
+    def _process_single(idx, row, text):
+        nonlocal errors
+        protected, store = _protect(text)
+        try:
+            sentences = model.word_segment(protected)
+            segmented = " ".join(sentences)
+            segmented = _restore(segmented, store)
+            segmented = re.sub(r"XPHX\s*\d+\s*XPHX", "<NUM>", segmented)
+            segmented = _canonicalize_emoji_tokens(segmented)
+            segmented = _canonicalize_placeholders(segmented)
+            row["text"] = segmented
+        except Exception as e:
+            errors += 1
+            if errors <= 20:
+                print(f"  [ERR] Dòng {row.get('id', '?')}: {str(e)[:120]}")
 
-            # Sanitize text before processing
-            text = _sanitize_text(text)
-            if not text.strip():
-                skipped += 1
-                continue
+    # ── Helper: process a batch via single word_segment call ──
+    def _process_batch(batch):
+        """batch = list of (index, row, sanitized_text)"""
+        nonlocal errors
 
-            # Protect placeholders
+        # Pre-process: protect placeholders for each row
+        prepared = []  # (idx, row, protected_text, store)
+        for idx, row, text in batch:
             protected, store = _protect(text)
+            prepared.append((idx, row, protected, store))
 
-            # Write "current" + checkpoint BEFORE calling VnCoreNLP — if JVM
-            # crashes, we know exactly which row caused it AND don't lose progress
-            _write_current(i)
-            _write_checkpoint(i - 1)  # mark previous row as last successfully done
+        # Join all protected texts with sentinel separator
+        combined = f"\n{SENTINEL}\n".join(p[2] for p in prepared)
 
-            try:
-                result = model.annotate_text(protected)
-                tokens = []
-                for sentence in result.values():
-                    for word_info in sentence:
-                        tokens.append(word_info["wordForm"])
-                segmented = " ".join(tokens)
+        try:
+            sentences = model.word_segment(combined)
+            combined_result = " ".join(sentences)
 
-                # Restore placeholders and canonicalize
+            # Split result back by sentinel
+            parts = _SENTINEL_RE.split(combined_result)
+
+            if len(parts) != len(prepared):
+                # Sentinel got mangled — fallback to single-row processing
+                for idx, row, text in batch:
+                    _process_single(idx, row, text)
+                return
+
+            # Map each part back to its row
+            for (idx, row, protected, store), segmented in zip(prepared, parts):
+                segmented = segmented.strip()
                 segmented = _restore(segmented, store)
                 segmented = re.sub(r"XPHX\s*\d+\s*XPHX", "<NUM>", segmented)
                 segmented = _canonicalize_emoji_tokens(segmented)
                 segmented = _canonicalize_placeholders(segmented)
                 row["text"] = segmented
 
-            except Exception as e:
-                errors += 1
-                if errors <= 20:
-                    err = str(e)
-                    print(f"  [ERR] Dòng {row.get('id', '?')}: {err[:120]}")
-                # keep original text on any error
+        except Exception:
+            # Batch failed — retry each row individually
+            for idx, row, text in batch:
+                _process_single(idx, row, text)
 
-            # Clear current marker after successful processing
+    # ── Main loop: process in batches ──
+    total_work = len(work_items)
+    try:
+        for b_start in range(0, total_work, BATCH_SIZE):
+            batch = work_items[b_start:b_start + BATCH_SIZE]
+            batch_first_idx = batch[0][0]
+            batch_last_idx = batch[-1][0]
+            last_i = batch_last_idx
+
+            # Write checkpoint BEFORE calling VnCoreNLP
+            _write_current(batch_first_idx)
+            _write_checkpoint(batch_first_idx - 1)
+
+            _process_batch(batch)
+
+            # Batch done — update checkpoint
             _clear_current()
-            _write_checkpoint(i)
+            _write_checkpoint(batch_last_idx)
 
             # Progress
-            done = i + 1
-            if done % 500 == 0 or done == total:
+            done_count = b_start + len(batch)
+            done_row = batch_last_idx + 1
+            if done_count % 500 < BATCH_SIZE or done_count >= total_work:
                 elapsed = time.perf_counter() - t0
-                processed = done - (resume_from + 1)
-                speed = processed / elapsed if elapsed > 0 else 0
-                remaining = total - done
+                speed = done_count / elapsed if elapsed > 0 else 0
+                remaining = total_work - done_count
                 eta = remaining / speed if speed > 0 else 0
-                print(f"  [{done}/{total}] {speed:.0f} rows/s | ETA {eta:.0f}s"
+                print(f"  [{done_row}/{total}] {speed:.0f} rows/s | ETA {eta:.0f}s"
                       f" | err={errors} skip={skipped} poison={poisoned}")
 
             # Save warehouse to disk periodically
-            if (i + 1) % SAVE_INTERVAL == 0:
+            if done_count % SAVE_INTERVAL < BATCH_SIZE:
                 _save_warehouse(rows)
                 elapsed = time.perf_counter() - t0
-                print(f"  ★ Saved tại dòng {i + 1}/{total} ({elapsed:.0f}s)")
+                print(f"  ★ Saved tại dòng {done_row}/{total} ({elapsed:.0f}s)")
 
     except KeyboardInterrupt:
         print(f"\n  [INTERRUPTED] Ctrl+C!")

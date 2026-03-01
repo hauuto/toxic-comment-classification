@@ -1,12 +1,11 @@
 """
-GeminiHierarchicalClassifier – Hierarchical Multi-label Classification (3-tier) via Google AI Studio (Gemini API).
+GeminiHierarchicalClassifier – Hierarchical Multi-label Classification (2-tier) via Google AI Studio (Gemini API).
 
-Kiến trúc 3-Tier (giữ nguyên như lmstudio_classifier.py):
-  Tier 1 (Spam Check):  "Spam" | "Not Spam"
-  Tier 2 (Toxic Check):  "Toxic" | "Clean"   (độc lập với Tier 1)
-  Tier 3 (Multi-label):
-      - Nếu Tier 2 = "Toxic"  → chọn từ ["Hate Speech", "Harassment", "Obscene"]
-      - Nếu Tier 2 = "Clean"  → chọn từ ["Positive", "Negative", "Neutral"]
+Kiến trúc 2-Tier:
+  Tier 1 (Toxic Check):  "Toxic" | "Clean"
+  Tier 2 (Multi-label):
+      - Nếu Tier 1 = "Toxic"  → chọn từ ["Hate Speech", "Harassment", "Obscene"]
+      - Nếu Tier 1 = "Clean"  → chọn từ ["Positive", "Negative", "Neutral"]
       (có thể 0, 1 hoặc nhiều nhãn)
 
 Cấu hình:
@@ -32,66 +31,154 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from lmstudio_classifier import (
-    TIER1_LABELS,
-    TIER2_LABELS,
-    TIER3_TOXIC_LABELS,
-    TIER3_CLEAN_LABELS,
-)
+
+# =========================================================================== #
+#  Label definitions (2-tier)
+# =========================================================================== #
+
+TIER1_LABELS = ["Toxic", "Clean"]
+TIER2_TOXIC_LABELS = ["Hate Speech", "Harassment", "Obscene"]
+TIER2_CLEAN_LABELS = ["Positive", "Negative", "Neutral"]
+TIER2_ALL_LABELS = TIER2_TOXIC_LABELS + TIER2_CLEAN_LABELS
 
 
-SYSTEM_PROMPT_JSON_OBJECT = """You are an expert Vietnamese comment classifier using a Hierarchical Multi-label Classification system with 3 Tiers.
+SYSTEM_PROMPT_JSON_OBJECT = """You are an expert Vietnamese social media comment classifier using a Hierarchical Multi-label Classification system with 2 Tiers.
 
-For EACH input comment, you must evaluate ALL 3 tiers and return a JSON object.
+For EACH input comment, you must evaluate ALL 2 tiers and return a JSON object.
 
-### Tier 1 – Spam Check
-Classify as exactly one of: "Spam" or "Not Spam".
-- "Spam": repetitive, promotional, irrelevant, or bot-generated comments.
-- "Not Spam": genuine human comments (can still be toxic).
+---
 
-### Tier 2 – Toxic Check (INDEPENDENT from Tier 1)
+### Tier 1 – Toxic Check
 Classify as exactly one of: "Toxic" or "Clean".
-"Toxic": content that includes insults, harassment, threats, profanity, or hate speech targeting a person or group.
-"Toxic" requires abusive or aggressive intent.
-"Clean": criticism, negative opinions, or complaints without insults or abusive language.
-IMPORTANT: A comment can be both "Spam" AND "Toxic", or "Spam" AND "Clean". Tier 1 and Tier 2 are independent.
 
-### Tier 3 – Multi-label (DEPENDS on Tier 2)
-Return a list of sub-labels:
-- If Tier 2 = "Toxic", choose from: ["Hate Speech", "Harassment", "Obscene"]
-  - "Hate Speech": attacks groups based on race, religion, gender, nationality, etc.
-  - "Harassment": personal attacks, bullying, threatening individuals.
-  - "Obscene": vulgar, sexually explicit, or profane language.
-- If Tier 2 = "Clean", choose from: ["Positive", "Negative", "Neutral"]
-  - "Positive": positive, supportive, encouraging comments.
-  - "Negative": negative, critical, complaining comments (but not toxic).
-  - "Neutral": neutral, factual, or informational comments.
-Tier 3 can contain 0, 1, or multiple labels simultaneously.
+- "Toxic": content that contains insults, harassment, threats, profanity, or hate speech targeting a person or group. Requires abusive or aggressive intent.
+- "Clean": criticism, negative opinions, complaints, or sarcasm WITHOUT insults or abusive language targeting a person or group.
+
+Key distinctions:
+- Criticism without insult = Clean (e.g., "Hàng xấu, không đáng tiền" = Clean)
+- Profanity of any form = Toxic (e.g., "đụ má", "vcl", "cặc", "vl", "đcm" = Toxic)
+- Sarcasm that mocks or demeans a specific person = Toxic
+- Sarcasm without a target = Clean
+
+---
+
+### Tier 2 – Multi-label Sub-classification (DEPENDS on Tier 1 result)
+
+**If Tier 1 = "Toxic"**, assign ALL applicable labels from: ["Hate Speech", "Harassment", "Obscene"]
+- "Hate Speech": attacks or demeans a GROUP based on region, race, religion, gender, nationality, or other identity. The target is a category of people, not a single individual.
+  → Example triggers: "Bắc kỳ", "dân 36", "đàn bà", "người Hoa", slurs against ethnic/regional groups.
+- "Harassment": personal attacks, bullying, threatening, or mocking a SPECIFIC individual.
+  → Example triggers: "mày", "thằng đó", "con này", direct insults aimed at one person.
+- "Obscene": vulgar language, sexual content, or profanity regardless of target.
+  → Example triggers: "đụ má", "địt mẹ", "cặc", "lồn", "đái", "vcl", "vl", "cc", "đcm", and all variants.
+
+A single comment can and often will have MULTIPLE toxic sub-labels simultaneously.
+Example: "Địt mẹ mày, đồ Bắc kỳ" → ["Obscene", "Harassment", "Hate Speech"]
+Example: "Con cặc" → ["Obscene"] (no specific target, just profanity)
+
+**If Tier 1 = "Clean"**, assign EXACTLY ONE label from: ["Positive", "Negative", "Neutral"]
+- "Positive": supportive, praising, encouraging, or happy comments.
+- "Negative": critical, complaining, disappointed, or dissatisfied comments (but NOT toxic).
+- "Neutral": factual, informational, or emotionally indifferent comments.
+
+Do NOT combine sentiment labels. Choose the single most dominant sentiment.
+
+---
+
+### Vietnamese Language Rules (CRITICAL)
+
+**Profanity detection — all of the following = Obscene:**
+- Full form: "đụ má", "địt mẹ", "cặc", "lồn", "đái", "đéo", "mẹ kiếp", "tiên sư"
+- Abbreviated: "đ.m", "đcm", "dm", "vcl", "vl", "cc", "đmm", "đmm"
+- Censored/bypass variants: "đ**", "c*c", "d.u ma", "đ()", "c@c", "đ.mạ", "cặk", "lồnn"
+- Phonetic substitutions: "dit me", "cak", "lon", "djt me"
+
+**Implicit Hate Speech — no profanity needed, still Hate Speech:**
+- Regional targeting: "Bắc kỳ", "dân 36", "Nam kỳ" (used derogatorily)
+- Ethnic/religious slurs or negative generalizations about a group
+- Statements like "Bọn X toàn lũ Y" (Group X are all Y) = Hate Speech
+
+**Sarcasm and irony:**
+- Sarcasm mocking a specific person = Harassment (± Obscene if profanity present)
+- Example: "Giỏi thật đấy, thông minh vcl" → Toxic: ["Harassment", "Obscene"]
+- Sarcasm with no specific target = Clean + Negative
+- Example: "Ồ hay nhỉ, sản phẩm tuyệt vời lắm" (about a product) → Clean: ["Negative"]
+
+---
 
 ### Output Format
-Reply with ONLY a JSON object with this exact shape:
+
+Reply with ONLY a valid JSON object in this exact shape:
 {"items": [
-  {"tier1_spam": "Spam"|"Not Spam", "tier2_toxic": "Toxic"|"Clean", "tier3_labels": ["...", ...]},
+  {"tier1_label": "Toxic"|"Clean", "tier2_labels": ["...", ...]},
   ...
 ]}
 
-Return ONLY a valid JSON object. Do not include any explanations, markdown formatting, or backticks.
+- "items" must be an array with one object per input comment, in the same order as input.
+- Do NOT add any explanation, numbering, markdown, backticks, or extra text outside the JSON.
 
-General Rules:
-- Evaluate tiers independently but logically consistent.
-- If Tier 2 = "Toxic", Tier 3 MUST contain at least one toxic label.
-- If Tier 2 = "Clean", Tier 3 MUST contain at least one clean label.
-- Toxic classification overrides sentiment classification.
-- Do not classify something as Spam based only on being short.
-- Criticism without insult = Clean + Negative.
-- Profanity automatically qualifies as Obscene (Toxic).
+---
 
-- "items" must be an array with one object per input comment, in the same order.
-- Do NOT add any explanation, numbering, markdown, or extra text outside the JSON."""
+### Hard Rules
 
+1. If Tier 1 = "Toxic" → Tier 2 MUST contain at least one of: "Hate Speech", "Harassment", "Obscene".
+2. If Tier 1 = "Clean" → Tier 2 MUST contain EXACTLY ONE of: "Positive", "Negative", "Neutral".
+3. Toxic classification overrides sentiment classification entirely.
+4. Profanity of ANY form (full, abbreviated, censored, phonetic) = Toxic + Obscene.
+5. Group-based negative generalization = Toxic + Hate Speech (even without profanity).
+6. A comment can be Harassment + Obscene + Hate Speech simultaneously.
 
+---
+
+### Few-shot Examples
+
+Input: "Sản phẩm tốt lắm, giao hàng nhanh, sẽ ủng hộ tiếp"
+Output: {"tier1_label": "Clean", "tier2_labels": ["Positive"]}
+
+Input: "Hàng xấu, không đáng tiền, không mua lần 2"
+Output: {"tier1_label": "Clean", "tier2_labels": ["Negative"]}
+
+Input: "Chưa dùng nên chưa biết, tạm cho 3 sao"
+Output: {"tier1_label": "Clean", "tier2_labels": ["Neutral"]}
+
+Input: "Địt mẹ mày thằng ngu"
+Output: {"tier1_label": "Toxic", "tier2_labels": ["Obscene", "Harassment"]}
+
+Input: "Con cặc"
+Output: {"tier1_label": "Toxic", "tier2_labels": ["Obscene"]}
+
+Input: "Bọn dân 36 toàn lũ ăn cắp"
+Output: {"tier1_label": "Toxic", "tier2_labels": ["Hate Speech"]}
+
+Input: "Bắc kỳ ăn cá rô phi, ăn nhầm lựu đạn chết cha Bắc kỳ"
+Output: {"tier1_label": "Toxic", "tier2_labels": ["Hate Speech"]}
+
+Input: "Địt mẹ mày, đồ Bắc kỳ"
+Output: {"tier1_label": "Toxic", "tier2_labels": ["Obscene", "Harassment", "Hate Speech"]}
+
+Input: "Mày ngu vcl, làm ăn kiểu gì vậy"
+Output: {"tier1_label": "Toxic", "tier2_labels": ["Obscene", "Harassment"]}
+
+Input: "Hàng như cái quần què, mả cha nhà mày lừa đảo à"
+Output: {"tier1_label": "Toxic", "tier2_labels": ["Obscene", "Harassment"]}
+
+Input: "Giỏi thật đấy, thông minh vcl, ai cũng phục mày"
+Output: {"tier1_label": "Toxic", "tier2_labels": ["Harassment", "Obscene"]}
+
+Input: "Má mày dạy mày tốt nên giờ mày mới khôn như vậy"
+Output: {"tier1_label": "Toxic", "tier2_labels": ["Harassment"]}
+
+Input: "Trời nắng quá bạn bị chập mạch phải không"
+Output: {"tier1_label": "Toxic", "tier2_labels": ["Harassment"]}
+
+Input: "Sản phẩm bình thường, không có gì nổi bật"
+Output: {"tier1_label": "Clean", "tier2_labels": ["Neutral"]}
+
+Input: "Dịch vụ tệ quá, chờ 2 tiếng mà không ai hỗ trợ"
+Output: {"tier1_label": "Clean", "tier2_labels": ["Negative"]}
+"""
 class GeminiHierarchicalClassifier:
-    """Gemini-backed classifier that returns the same 3-tier schema as LMStudioClassifier in pipeline."""
+    """Gemini-backed classifier that returns 2-tier schema (tier1_label + tier2_labels)."""
 
     def __init__(
         self,
@@ -418,9 +505,8 @@ def _fuzzy_match(raw: str, candidates: List[str], default: Optional[str]) -> Opt
 
 def _default_result() -> Dict[str, Any]:
     return {
-        "tier1_spam": "Not Spam",
-        "tier2_toxic": "Clean",
-        "tier3_labels": ["Neutral"],
+        "tier1_label": "Clean",
+        "tier2_labels": ["Neutral"],
     }
 
 
@@ -428,30 +514,27 @@ def _validate_tier_result(obj: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(obj, dict):
         return _default_result()
 
-    tier1 = str(obj.get("tier1_spam", "Not Spam")).strip()
+    # Tier 1
+    tier1 = str(obj.get("tier1_label", "Clean")).strip()
     if tier1 not in TIER1_LABELS:
-        tier1 = _fuzzy_match(tier1, TIER1_LABELS, "Not Spam") or "Not Spam"
+        tier1 = _fuzzy_match(tier1, TIER1_LABELS, "Clean") or "Clean"
 
-    tier2 = str(obj.get("tier2_toxic", "Clean")).strip()
-    if tier2 not in TIER2_LABELS:
-        tier2 = _fuzzy_match(tier2, TIER2_LABELS, "Clean") or "Clean"
+    # Tier 2
+    raw_tier2 = obj.get("tier2_labels", [])
+    if isinstance(raw_tier2, str):
+        raw_tier2 = [raw_tier2]
+    if not isinstance(raw_tier2, list):
+        raw_tier2 = []
 
-    raw_tier3 = obj.get("tier3_labels", [])
-    if isinstance(raw_tier3, str):
-        raw_tier3 = [raw_tier3]
-    if not isinstance(raw_tier3, list):
-        raw_tier3 = []
-
-    valid_pool = TIER3_TOXIC_LABELS if tier2 == "Toxic" else TIER3_CLEAN_LABELS
-    tier3: List[str] = []
-    for lbl in raw_tier3:
+    valid_pool = TIER2_TOXIC_LABELS if tier1 == "Toxic" else TIER2_CLEAN_LABELS
+    tier2: List[str] = []
+    for lbl in raw_tier2:
         lbl = str(lbl).strip()
         matched = _fuzzy_match(lbl, valid_pool, None)
-        if matched and matched not in tier3:
-            tier3.append(matched)
+        if matched and matched not in tier2:
+            tier2.append(matched)
 
     return {
-        "tier1_spam": tier1,
-        "tier2_toxic": tier2,
-        "tier3_labels": tier3,
+        "tier1_label": tier1,
+        "tier2_labels": tier2,
     }

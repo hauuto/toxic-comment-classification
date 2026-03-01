@@ -7,7 +7,6 @@ import customtkinter as ctk
 from tkinter import messagebox, ttk
 
 from gemini_hierarchical_classifier import GeminiHierarchicalClassifier
-from lmstudio_classifier import LMStudioClassifier
 from nlp_pipeline.warehouse import (
     CLUSTER_SIZE_DEFAULT,
     get_warehouse_clusters,
@@ -35,20 +34,15 @@ def _setup_labeling_tab(app):
     conn_frame.grid(row=0, column=0, padx=10, pady=5, sticky="ew")
     conn_frame.grid_columnconfigure(1, weight=1)
 
-    ctk.CTkLabel(conn_frame, text="LM Studio Endpoint:").grid(row=0, column=0, padx=10, pady=8, sticky="w")
-    app.lbl_endpoint_var = ctk.StringVar(value="http://localhost:1234")
-    app.lbl_endpoint_entry = ctk.CTkEntry(conn_frame, textvariable=app.lbl_endpoint_var, width=350)
-    app.lbl_endpoint_entry.grid(row=0, column=1, padx=5, pady=8, sticky="w")
-
-    ctk.CTkLabel(conn_frame, text="Model:").grid(row=0, column=2, padx=(15, 5), pady=8, sticky="w")
+    ctk.CTkLabel(conn_frame, text="Gemini Model:").grid(row=0, column=0, padx=10, pady=8, sticky="w")
     app.lbl_model_var = ctk.StringVar(value="")
     app.lbl_model_entry = ctk.CTkEntry(
         conn_frame,
         textvariable=app.lbl_model_var,
-        width=250,
-        placeholder_text="(để trống = model đang load)",
+        width=300,
+        placeholder_text="(mặc định: gemini-2.0-flash)",
     )
-    app.lbl_model_entry.grid(row=0, column=3, padx=5, pady=8, sticky="w")
+    app.lbl_model_entry.grid(row=0, column=1, padx=5, pady=8, sticky="w")
 
     app.lbl_test_btn = ctk.CTkButton(
         conn_frame,
@@ -56,7 +50,7 @@ def _setup_labeling_tab(app):
         width=140,
         command=app._lbl_test_connection,
     )
-    app.lbl_test_btn.grid(row=0, column=4, padx=10, pady=8)
+    app.lbl_test_btn.grid(row=0, column=2, padx=10, pady=8)
 
     ctrl_frame = ctk.CTkFrame(tab)
     ctrl_frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
@@ -136,17 +130,15 @@ def _setup_labeling_tab(app):
     table_frame.grid_rowconfigure(0, weight=1)
     table_frame.grid_columnconfigure(0, weight=1)
 
-    app.lbl_tree = ttk.Treeview(table_frame, columns=("id", "text", "tier1", "tier2", "tier3"), show="headings")
+    app.lbl_tree = ttk.Treeview(table_frame, columns=("id", "text", "tier1", "tier2"), show="headings")
     app.lbl_tree.heading("id", text="ID")
     app.lbl_tree.heading("text", text="Nội dung bình luận")
-    app.lbl_tree.heading("tier1", text="Tier1 Spam")
-    app.lbl_tree.heading("tier2", text="Tier2 Toxic")
-    app.lbl_tree.heading("tier3", text="Tier3 Labels")
+    app.lbl_tree.heading("tier1", text="Tier1 Toxic")
+    app.lbl_tree.heading("tier2", text="Tier2 Labels")
     app.lbl_tree.column("id", width=40, anchor="center")
-    app.lbl_tree.column("text", width=350, anchor="w")
+    app.lbl_tree.column("text", width=400, anchor="w")
     app.lbl_tree.column("tier1", width=80, anchor="center")
-    app.lbl_tree.column("tier2", width=80, anchor="center")
-    app.lbl_tree.column("tier3", width=150, anchor="center")
+    app.lbl_tree.column("tier2", width=180, anchor="center")
 
     lbl_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=app.lbl_tree.yview)
     app.lbl_tree.configure(yscrollcommand=lbl_scroll.set)
@@ -298,50 +290,23 @@ def _lbl_on_cluster_change(app, selected_value: str):
 
 
 def _lbl_test_connection(app):
-    gemini_enabled = bool(os.getenv("GEMINI_API_KEY", "").strip())
-    base_url = app.lbl_endpoint_var.get().strip()
     model_name = app.lbl_model_var.get().strip()
-
-    if gemini_enabled:
-        effective_model = model_name or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-        app._lbl_log(f"🔌 Đang kiểm tra Gemini API (model={effective_model}) ...")
-    else:
-        if not base_url:
-            messagebox.showwarning("Lỗi", "Vui lòng nhập endpoint!")
-            return
-        app._lbl_log(f"🔌 Đang kiểm tra kết nối tới {base_url} ...")
+    effective_model = model_name or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    app._lbl_log(f"🔌 Đang kiểm tra Gemini API (model={effective_model}) ...")
 
     app.lbl_test_btn.configure(state="disabled", text="Đang kiểm tra...")
 
     def _test():
-        if gemini_enabled:
-            result = GeminiHierarchicalClassifier.test_connection(model=model_name)
-            if result["ok"]:
-                models_str = ", ".join(result["models"]) if result["models"] else "(unknown model)"
-                app.after(0, app._lbl_log, f"✅ Gemini OK! Model: {models_str}")
-                app.after(0, lambda: app.lbl_status_label.configure(text="✅ Gemini API sẵn sàng", text_color="green"))
-                if result.get("models") and not model_name:
-                    app.after(0, lambda: app.lbl_model_var.set(result["models"][0]))
-            else:
-                app.after(0, app._lbl_log, f"❌ Lỗi Gemini: {result['error']}")
-                app.after(0, lambda: app.lbl_status_label.configure(text="❌ Không thể kết nối Gemini", text_color="red"))
+        result = GeminiHierarchicalClassifier.test_connection(model=model_name)
+        if result["ok"]:
+            models_str = ", ".join(result["models"]) if result["models"] else "(unknown model)"
+            app.after(0, app._lbl_log, f"✅ Gemini OK! Model: {models_str}")
+            app.after(0, lambda: app.lbl_status_label.configure(text="✅ Gemini API sẵn sàng", text_color="green"))
+            if result.get("models") and not model_name:
+                app.after(0, lambda: app.lbl_model_var.set(result["models"][0]))
         else:
-            result = LMStudioClassifier.test_connection(base_url)
-            if result["ok"]:
-                models_str = ", ".join(result["models"]) if result["models"] else "(không có model nào)"
-                app.after(0, app._lbl_log, f"✅ Kết nối thành công! Models: {models_str}")
-                app.after(
-                    0,
-                    lambda: app.lbl_status_label.configure(
-                        text=f"✅ LM Studio đang chạy — {len(result['models'])} model(s)",
-                        text_color="green",
-                    ),
-                )
-                if len(result["models"]) == 1:
-                    app.after(0, lambda: app.lbl_model_var.set(result["models"][0]))
-            else:
-                app.after(0, app._lbl_log, f"❌ Lỗi: {result['error']}")
-                app.after(0, lambda: app.lbl_status_label.configure(text="❌ Không thể kết nối LM Studio", text_color="red"))
+            app.after(0, app._lbl_log, f"❌ Lỗi Gemini: {result['error']}")
+            app.after(0, lambda: app.lbl_status_label.configure(text="❌ Không thể kết nối Gemini", text_color="red"))
         app.after(0, lambda: app.lbl_test_btn.configure(state="normal", text="🔌 Test Connection"))
 
     threading.Thread(target=_test, daemon=True).start()
@@ -351,10 +316,8 @@ def _lbl_start_labeling(app):
     if app._lbl_is_running:
         return
 
-    gemini_enabled = bool(os.getenv("GEMINI_API_KEY", "").strip())
-    base_url = app.lbl_endpoint_var.get().strip()
-    if not gemini_enabled and not base_url:
-        messagebox.showwarning("Lỗi", "Vui lòng nhập endpoint!")
+    if not os.getenv("GEMINI_API_KEY", "").strip():
+        messagebox.showwarning("Lỗi", "Thiếu GEMINI_API_KEY! Hãy set trong .env hoặc environment.")
         return
 
     selected_cluster_text = (app.lbl_cluster_var.get() or "").strip()
@@ -382,7 +345,7 @@ def _lbl_start_labeling(app):
         workers = 1
     workers = max(1, min(workers, 32))
 
-    request_retries = 3 if gemini_enabled else 1
+    request_retries = 3
     model_name = app.lbl_model_var.get().strip()
     effective_model = model_name or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
@@ -398,7 +361,6 @@ def _lbl_start_labeling(app):
     app.lbl_start_btn.configure(state="disabled", text="Đang chạy...")
     app.lbl_stop_btn.configure(state="normal")
     app.lbl_reset_btn.configure(state="disabled")
-    app.lbl_endpoint_entry.configure(state="disabled")
     app.lbl_model_entry.configure(state="disabled")
 
     app._lbl_log(f"🚀 Bắt đầu gán nhãn {len(rows)} bình luận")
@@ -409,14 +371,8 @@ def _lbl_start_labeling(app):
             app._lbl_log(
                 f"   Cluster: {cluster_index + 1} ({selected_meta.get('start_id')}–{selected_meta.get('end_id')})"
             )
-    if gemini_enabled:
-        app._lbl_log("   Provider: Gemini (Google AI Studio)")
-        app._lbl_log(f"   Model: {effective_model}")
-    else:
-        endpoint = f"{base_url.rstrip('/')}/v1/chat/completions"
-        app._lbl_log("   Provider: LM Studio")
-        app._lbl_log(f"   Endpoint: {endpoint}")
-        app._lbl_log(f"   Model: {model_name or '(auto)'}")
+    app._lbl_log("   Provider: Gemini (Google AI Studio)")
+    app._lbl_log(f"   Model: {effective_model}")
     app._lbl_log(f"   Batch size: {batch_size}")
     app._lbl_log(f"   Workers: {workers}")
     app._lbl_log("=" * 50)
@@ -424,12 +380,8 @@ def _lbl_start_labeling(app):
     def _labeling_thread():
         import pandas as pd
 
-        endpoint = f"{base_url.rstrip('/')}/v1/chat/completions"
-
         def _make_classifier():
-            if gemini_enabled:
-                return GeminiHierarchicalClassifier(model=effective_model, timeout=120)
-            return LMStudioClassifier(endpoint=endpoint, model=model_name, timeout=120)
+            return GeminiHierarchicalClassifier(model=effective_model, timeout=120)
 
         classifier_single = None
         if workers <= 1:
@@ -458,15 +410,12 @@ def _lbl_start_labeling(app):
                     if eid:
                         labeled_ids.add(eid)
                     existing_rows.append(erow)
-                    t1 = erow.get("tier1_spam", "")
-                    t2 = erow.get("tier2_toxic", "")
-                    t3_str = erow.get("tier3_labels", "")
+                    t1 = erow.get("tier1_label", "")
+                    t2_str = erow.get("tier2_labels", "")
                     if t1:
                         label_counts[t1] = label_counts.get(t1, 0) + 1
-                    if t2:
-                        label_counts[t2] = label_counts.get(t2, 0) + 1
-                    if t3_str:
-                        for lbl in str(t3_str).split("|"):
+                    if t2_str:
+                        for lbl in str(t2_str).split("|"):
                             lbl = lbl.strip()
                             if lbl:
                                 label_counts[lbl] = label_counts.get(lbl, 0) + 1
@@ -483,7 +432,7 @@ def _lbl_start_labeling(app):
                 return 0
 
         # Resume behavior:
-        # - For "Toàn bộ": start from (max labeled id + 1) and go ascending (513→1000).
+        # - For "Toàn bộ": start from (max labeled id + 1) and go ascending.
         # - For a cluster: skip any already-labeled ids inside that cluster.
         max_labeled_id = max(labeled_ids) if labeled_ids else 0
         resume_start_id = max_labeled_id + 1 if (is_all and max_labeled_id > 0) else None
@@ -498,7 +447,6 @@ def _lbl_start_labeling(app):
                     existing_rows_cluster.append(erow)
 
         # "skipped" is used as progress baseline.
-        # For "All", it should reflect max labeled id (so UI shows 512/1000).
         if is_all and max_labeled_id > 0:
             skipped = min(max_labeled_id, total)
         else:
@@ -532,7 +480,6 @@ def _lbl_start_labeling(app):
             app.after(0, lambda: app.lbl_start_btn.configure(state="normal", text="▶ Bắt Đầu Gán Nhãn"))
             app.after(0, lambda: app.lbl_stop_btn.configure(state="disabled"))
             app.after(0, lambda: app.lbl_reset_btn.configure(state="normal"))
-            app.after(0, lambda: app.lbl_endpoint_entry.configure(state="normal"))
             app.after(0, lambda: app.lbl_model_entry.configure(state="normal"))
             app.after(0, app.refresh_file_list)
             return
@@ -549,14 +496,12 @@ def _lbl_start_labeling(app):
             nonlocal processed, file_exists
             csv_rows = []
             for row_i, pred in zip(batch_rows, predictions):
-                t1 = pred.get("tier1_spam", "Not Spam")
-                t2 = pred.get("tier2_toxic", "Clean")
-                t3_list = pred.get("tier3_labels", []) or []
-                t3 = "|".join(t3_list) if t3_list else ""
+                t1 = pred.get("tier1_label", "Clean")
+                t2_list = pred.get("tier2_labels", []) or []
+                t2 = "|".join(t2_list) if t2_list else ""
 
                 label_counts[t1] = label_counts.get(t1, 0) + 1
-                label_counts[t2] = label_counts.get(t2, 0) + 1
-                for lbl in t3_list:
+                for lbl in t2_list:
                     label_counts[lbl] = label_counts.get(lbl, 0) + 1
 
                 processed += 1
@@ -564,15 +509,14 @@ def _lbl_start_labeling(app):
                     {
                         "id": row_i.get("id", processed),
                         "text": row_i.get("text", ""),
-                        "tier1_spam": t1,
-                        "tier2_toxic": t2,
-                        "tier3_labels": t3,
+                        "tier1_label": t1,
+                        "tier2_labels": t2,
                     }
                 )
 
                 rid = row_i.get("id", processed)
                 dt = str(row_i.get("text", "")).replace("\n", "  ")[:80]
-                app.after(0, lambda r=rid, d=dt, s1=t1, s2=t2, s3=t3: app.lbl_tree.insert("", "end", values=(r, d, s1, s2, s3)))
+                app.after(0, lambda r=rid, d=dt, s1=t1, s2=t2: app.lbl_tree.insert("", "end", values=(r, d, s1, s2)))
 
             if csv_rows:
                 pd.DataFrame(csv_rows).to_csv(
@@ -717,7 +661,6 @@ def _lbl_start_labeling(app):
             app.after(0, lambda: app.lbl_start_btn.configure(state="normal", text="▶ Bắt Đầu Gán Nhãn"))
             app.after(0, lambda: app.lbl_stop_btn.configure(state="disabled"))
             app.after(0, lambda: app.lbl_reset_btn.configure(state="normal"))
-            app.after(0, lambda: app.lbl_endpoint_entry.configure(state="normal"))
             app.after(0, lambda: app.lbl_model_entry.configure(state="normal"))
             app.after(0, app.refresh_file_list)
 
