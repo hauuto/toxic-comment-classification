@@ -26,7 +26,7 @@ except Exception:
         return False
 from tqdm import tqdm
 
-from gemini_hierarchical_classifier import GeminiHierarchicalClassifier
+from gemini_hierarchical_classifier import GeminiHierarchicalClassifier, GeminiSafetyBlockError
 
 
 POSTFIX_EVERY = 50

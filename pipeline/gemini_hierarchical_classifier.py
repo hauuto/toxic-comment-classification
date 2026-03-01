@@ -33,6 +33,31 @@ import requests
 
 
 # =========================================================================== #
+#  Custom exceptions
+# =========================================================================== #
+
+class GeminiSafetyBlockError(RuntimeError):
+    """Raised when the Gemini API returns HTTP 200 but the output is empty
+    due to safety filtering (finishReason=SAFETY, blockReason, etc.).
+    Retrying the same content will produce the same result, so the caller
+    should fall back to defaults or split the batch."""
+    pass
+
+
+# =========================================================================== #
+#  Safety settings (shared)
+# =========================================================================== #
+
+SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+]
+
+
+# =========================================================================== #
 #  Label definitions (2-tier)
 # =========================================================================== #
 
@@ -238,12 +263,7 @@ class GeminiHierarchicalClassifier:
                 "temperature": 0.0,
                 "maxOutputTokens": 200,
             },
-            "safetySettings": [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            ],
+            "safetySettings": SAFETY_SETTINGS,
         }
 
         try:
@@ -296,12 +316,7 @@ class GeminiHierarchicalClassifier:
                 # maxOutputTokens set per-attempt (scaled)
                 "maxOutputTokens": base_max_tokens,
             },
-            "safetySettings": [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            ],
+            "safetySettings": SAFETY_SETTINGS,
         }
 
         def _retry_sleep_seconds(attempt_index: int, response: requests.Response | None) -> float:
@@ -359,7 +374,15 @@ class GeminiHierarchicalClassifier:
                 except Exception as e:
                     last_body_snippet = (r.text or "")[:1200]
                     raise RuntimeError(f"Gemini returned non-JSON response: {last_body_snippet}") from e
+
+                # --- Detect safety-blocked responses (HTTP 200 but empty) ---
                 text = _get_gemini_text(data)
+                if not text:
+                    diag = _diagnose_empty_output(data)
+                    if diag:
+                        # Safety block → do NOT retry the same content; raise immediately.
+                        raise GeminiSafetyBlockError(diag)
+
                 items = _parse_items(text, expected_n=len(tasks), strict=strict)
                 validated = [_validate_tier_result(obj) for obj in items]
 
@@ -368,6 +391,16 @@ class GeminiHierarchicalClassifier:
 
                 # Parsed but shape mismatch → treat as retryable parsing failure.
                 raise ValueError("Gemini output parse mismatch")
+
+            except GeminiSafetyBlockError:
+                # Safety block is deterministic — retrying won't help.
+                # Fall back: if batch has >1 item, split into single-comment requests.
+                if len(tasks) > 1:
+                    return self._predict_single_fallback(tasks, retries=retries, strict=strict)
+                # Single comment was blocked → return defaults (or raise in strict mode).
+                if strict:
+                    raise
+                return [_default_result() for _ in range(len(tasks))]
 
             except Exception as e:
                 last_error = e
@@ -395,12 +428,86 @@ class GeminiHierarchicalClassifier:
         _ = last_error
         return [_default_result() for _ in range(len(tasks))]
 
+    # ------------------------------------------------------------------
+    # Single-comment fallback (used when a batch is safety-blocked)
+    # ------------------------------------------------------------------
+    def _predict_single_fallback(
+        self,
+        tasks: List[Dict[str, Any]],
+        retries: int = 1,
+        strict: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Predict each comment individually to isolate safety-blocked items.
+
+        Comments that are individually blocked get default labels; the rest
+        are classified normally.  This avoids losing an entire batch because
+        of one problematic comment.
+        """
+        results: List[Dict[str, Any]] = []
+        for task in tasks:
+            try:
+                preds = self.predict([task], retries=retries, strict=False)
+                results.append(preds[0] if preds else _default_result())
+            except GeminiSafetyBlockError:
+                # Individual comment blocked → assign defaults silently.
+                results.append(_default_result())
+            except Exception:
+                results.append(_default_result())
+        return results
+
 
 def _get_gemini_text(result: Dict[str, Any]) -> str:
+    """Extract the text content from a Gemini API response.
+
+    Returns an empty string if the response has no text (e.g. safety-blocked).
+    The caller should use ``_diagnose_empty_output()`` to determine the reason.
+    """
     try:
         return result["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
         return ""
+
+
+def _diagnose_empty_output(result: Dict[str, Any]) -> str:
+    """Return a human-readable diagnosis when ``_get_gemini_text`` returns empty.
+
+    Inspects ``promptFeedback.blockReason`` and ``candidates[0].finishReason``
+    to determine whether the Gemini response was safety-blocked.
+
+    Returns an empty string if no obvious safety block is detected (i.e. the
+    empty output might be a transient issue worth retrying).
+    """
+    parts: List[str] = []
+
+    # Check prompt-level block
+    prompt_feedback = result.get("promptFeedback", {})
+    block_reason = prompt_feedback.get("blockReason", "")
+    if block_reason:
+        parts.append(f"promptFeedback.blockReason={block_reason}")
+
+    # Check candidate-level finish reason
+    candidates = result.get("candidates", [])
+    if candidates:
+        finish_reason = candidates[0].get("finishReason", "")
+        if finish_reason and finish_reason not in ("STOP", "MAX_TOKENS"):
+            parts.append(f"finishReason={finish_reason}")
+
+        # Collect safety ratings that triggered filtering
+        safety_ratings = candidates[0].get("safetyRatings", [])
+        blocked_cats = [
+            sr.get("category", "?")
+            for sr in safety_ratings
+            if sr.get("blocked") is True
+        ]
+        if blocked_cats:
+            parts.append(f"blockedCategories={blocked_cats}")
+    elif not candidates and block_reason:
+        # No candidates at all → prompt was blocked before generation
+        parts.append("no candidates returned (prompt blocked)")
+
+    if parts:
+        return "Safety-blocked: " + "; ".join(parts)
+    return ""
 
 
 def _strip_code_fences(text: str) -> str:

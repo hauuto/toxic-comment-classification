@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import customtkinter as ctk
 from tkinter import messagebox, ttk
 
-from gemini_hierarchical_classifier import GeminiHierarchicalClassifier
+from gemini_hierarchical_classifier import GeminiHierarchicalClassifier, GeminiSafetyBlockError
 from nlp_pipeline.warehouse import (
     CLUSTER_SIZE_DEFAULT,
     get_warehouse_clusters,
@@ -565,6 +565,10 @@ def _lbl_start_labeling(app):
                     app.after(0, app._lbl_log, f"📤 Gửi batch {i + 1}/{len(batches)} (n={len(batch_tasks)}) ...")
                     try:
                         predictions = classifier_single.predict(batch_tasks, retries=request_retries, strict=True)
+                    except GeminiSafetyBlockError as e:
+                        # Safety block is deterministic — log and use defaults, don't stop the job.
+                        app.after(0, app._lbl_log, f"⚠️ Batch {i + 1}/{len(batches)} bị safety-block: {e}. Gán nhãn mặc định (Clean/Neutral).")
+                        predictions = [{"tier1_label": "Clean", "tier2_labels": ["Neutral"]} for _ in batch_tasks]
                     except Exception as e:
                         app._lbl_stop_event.set()
                         raise RuntimeError(f"Request thất bại ở batch {i + 1}/{len(batches)}: {e}") from e
@@ -618,6 +622,9 @@ def _lbl_start_labeling(app):
                         batch_rows, batch_tasks = batches[next_to_write]
                         try:
                             predictions = fut.result()
+                        except GeminiSafetyBlockError as e:
+                            app.after(0, app._lbl_log, f"⚠️ Batch {next_to_write + 1}/{len(batches)} bị safety-block: {e}. Gán nhãn mặc định (Clean/Neutral).")
+                            predictions = [{"tier1_label": "Clean", "tier2_labels": ["Neutral"]} for _ in batch_tasks]
                         except Exception as e:
                             app._lbl_stop_event.set()
                             raise RuntimeError(f"Request thất bại ở batch {next_to_write + 1}/{len(batches)}: {e}") from e
