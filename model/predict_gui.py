@@ -1,7 +1,8 @@
 """
-Toxic Comment Classifier – GUI Prediction Tool
+Toxic Comment Classifier – GUI Prediction Tool (63.11% Model)
 Uses the trained C-LSTM model with the full Vietnamese NLP preprocessing pipeline.
 Supports both CPU and GPU inference.
+Toxic threshold: 0.38 (tuned for this model checkpoint).
 """
 
 import os
@@ -30,6 +31,11 @@ if PIPELINE_DIR not in sys.path:
 MODEL_PATH = os.path.join(MODEL_DIR, "best_c_lstm_model.pth")
 VOCAB_PATH = os.path.join(MODEL_DIR, "vocab.json")
 W2V_PATH = os.path.join(MODEL_DIR, "custom_word2vec.npy")
+
+# ---------------------------------------------------------------------------
+# Toxic threshold (tuned for 63.11% model)
+# ---------------------------------------------------------------------------
+TOXIC_THRESHOLD = 0.35
 
 # ---------------------------------------------------------------------------
 # Device selection – works on CPU, CUDA, and MPS (Apple Silicon)
@@ -153,7 +159,7 @@ class ToxicCommentPredictor:
             l_tox, l_sent, l_tdet = self.model(input_tensor)
 
             prob_tox = torch.sigmoid(l_tox).item()
-            is_toxic = prob_tox >= 0.5
+            is_toxic = prob_tox >= TOXIC_THRESHOLD
 
             # Tier 1
             tier1 = "Toxic" if is_toxic else "Clean"
@@ -213,7 +219,7 @@ class PredictorApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Toxic Comment Classifier – Dự đoán bình luận độc hại")
+        self.title("Toxic Comment Classifier – Dự đoán bình luận độc hại (63.11%)")
         self.geometry("900x720")
         self.minsize(750, 600)
         self.grid_columnconfigure(0, weight=1)
@@ -229,13 +235,13 @@ class PredictorApp(ctk.CTk):
 
         ctk.CTkLabel(
             header,
-            text="🔍  Toxic Comment Classifier",
+            text="🔍  Toxic Comment Classifier (63.11%)",
             font=("Arial", 20, "bold"),
         ).grid(row=0, column=0, sticky="w", padx=15, pady=(10, 0))
 
         self.device_label = ctk.CTkLabel(
             header,
-            text=f"Device: {DEVICE}  |  Đang tải mô hình...",
+            text=f"Device: {DEVICE}  |  Threshold: {TOXIC_THRESHOLD}  |  Đang tải mô hình...",
             text_color="gray",
             font=("Arial", 12),
         )
@@ -335,7 +341,7 @@ class PredictorApp(ctk.CTk):
 
     def _on_model_loaded(self, backend: str):
         self.device_label.configure(
-            text=f"Device: {DEVICE}  |  Segmentor: {backend}  |  ✅ Sẵn sàng",
+            text=f"Device: {DEVICE}  |  Threshold: {TOXIC_THRESHOLD}  |  Segmentor: {backend}  |  ✅ Sẵn sàng",
             text_color="green",
         )
         self.predict_btn.configure(state="normal")
@@ -378,7 +384,7 @@ class PredictorApp(ctk.CTk):
             "",
             f"{'='*60}",
             f"  {tier1_icon}  TIER 1 – Phân loại: {res['tier1']}  "
-            f"(Độ tin cậy: {res['tier1_conf']:.1%})",
+            f"(Độ tin cậy: {res['tier1_conf']:.1%})  [Ngưỡng: {TOXIC_THRESHOLD}]",
             f"{'='*60}",
             "",
         ]
