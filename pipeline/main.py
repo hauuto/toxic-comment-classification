@@ -23,12 +23,11 @@ from nlp_pipeline.warehouse import (
 )
 from nlp_pipeline import VietnameseCommentPreprocessor
 from google_drive import upload_warehouse, download_warehouse, upload_labeled_data, download_labeled_data
-from lmstudio_classifier import (LMStudioClassifier, TIER1_LABELS, TIER2_LABELS,
-                                  TIER3_TOXIC_LABELS, TIER3_CLEAN_LABELS, TIER3_ALL_LABELS)
-from gemini_hierarchical_classifier import GeminiHierarchicalClassifier
+from gemini_hierarchical_classifier import (GeminiHierarchicalClassifier,
+                                             TIER1_LABELS, TIER2_TOXIC_LABELS,
+                                             TIER2_CLEAN_LABELS, TIER2_ALL_LABELS)
 from nlp_pipeline.word_segmentor import WordSegmentor
 from google_drive import upload_warehouse, download_warehouse
-from lmstudio_classifier import LMStudioClassifier
 
 from ui_tabs import auto_labeling_tab as _auto_labeling_tab
 from ui_tabs import crawler_tab as _crawler_tab
@@ -480,9 +479,6 @@ class App(ctk.CTk):
     def _lm_load_data(self):
         return _label_manager_tab._lm_load_data(self)
 
-    @staticmethod
-    def _migrate_old_label(old_label: str):
-        return _label_manager_tab._migrate_old_label(old_label)
 
     def _lm_display_rows(self, rows):
         return _label_manager_tab._lm_display_rows(self, rows)

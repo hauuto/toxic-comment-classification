@@ -1,12 +1,17 @@
 import csv
+import functools
 import os
 import threading
 import time
 
 import customtkinter as ctk
+import pandas as pd
+from pandarallel import pandarallel
 from tkinter import messagebox, ttk
 
 from google_drive import download_warehouse, upload_warehouse
+from nlp_pipeline import _canonicalize_emoji_tokens, _canonicalize_placeholders
+from nlp_pipeline._parallel_worker import preprocess_no_segment
 from nlp_pipeline.warehouse import overwrite_warehouse, read_warehouse
 
 
@@ -305,34 +310,71 @@ def wh_run_preprocessing(app):
         try:
             preprocessor = app._get_preprocessor(segmentor_backend)
             total = len(app._wh_all_rows)
-            kept = []
-            removed_count = 0
 
-            for idx, row in enumerate(app._wh_all_rows):
-                text = row.get("text", "")
-                if not text.strip():
-                    removed_count += 1
-                    continue
-                result = preprocessor.process_comment(
-                    text,
-                    use_decoder=u_dec,
-                    use_filter=u_fil,
-                    use_normalizer=u_nor,
-                    use_segmentor=use_segmentor,
-                )
-                if result["is_valid"]:
-                    kept.append({"id": len(kept) + 1, "text": result["cleaned_text"]})
-                else:
-                    removed_count += 1
+            # ── Phase 1: Decode → Filter → Normalize (parallel via pandarallel) ──
+            app.after(
+                0,
+                lambda: app.wh_status_label.configure(
+                    text=f"Phase 1/2: Tiền xử lý song song ({total} dòng)...",
+                    text_color="orange",
+                ),
+            )
 
-                if (idx + 1) % 500 == 0:
-                    app.after(
-                        0,
-                        lambda i=idx + 1: app.wh_status_label.configure(
-                            text=f"Đang xử lý... {i}/{total}",
-                            text_color="orange",
-                        ),
-                    )
+            nb_workers = min(max((os.cpu_count() or 4) - 2, 1), 4)
+            pandarallel.initialize(nb_workers=nb_workers, progress_bar=False, verbose=0)
+
+            df = pd.DataFrame(app._wh_all_rows)
+
+            _row_fn = functools.partial(
+                preprocess_no_segment,
+                use_decoder=u_dec,
+                use_filter=u_fil,
+                use_normalizer=u_nor,
+            )
+            df["cleaned"] = df["text"].parallel_apply(_row_fn)
+
+            # Drop invalid rows
+            df = df.dropna(subset=["cleaned"]).reset_index(drop=True)
+            phase1_kept = len(df)
+            removed_count = total - phase1_kept
+
+            app.after(
+                0,
+                lambda: app.wh_status_label.configure(
+                    text=f"Phase 1 xong: giữ {phase1_kept}/{total} dòng. "
+                         + ("Đang tách từ..." if use_segmentor else "Hoàn tất."),
+                    text_color="orange" if use_segmentor else "green",
+                ),
+            )
+
+            # ── Phase 2: Segmentation (serial – VnCoreNLP JVM is single-threaded) ──
+            if use_segmentor and phase1_kept > 0:
+                cleaned_list = df["cleaned"].tolist()
+                for idx in range(len(cleaned_list)):
+                    try:
+                        segmented = preprocessor.segmentor.segment(cleaned_list[idx])
+                        if segmented:
+                            segmented = _canonicalize_emoji_tokens(segmented)
+                            segmented = _canonicalize_placeholders(segmented)
+                            cleaned_list[idx] = segmented
+                    except Exception:
+                        pass  # keep unsegmented text on failure
+
+                    if (idx + 1) % 500 == 0 or idx + 1 == len(cleaned_list):
+                        app.after(
+                            0,
+                            lambda i=idx + 1: app.wh_status_label.configure(
+                                text=f"Phase 2/2: Tách từ... {i}/{phase1_kept}",
+                                text_color="orange",
+                            ),
+                        )
+                df["cleaned"] = cleaned_list
+
+            # ── Build final result ──
+            kept = [
+                {"id": i + 1, "text": row["cleaned"]}
+                for i, row in df.iterrows()
+            ]
 
             app._wh_all_rows = kept
             overwrite_warehouse(kept)
@@ -347,7 +389,8 @@ def wh_run_preprocessing(app):
             )
             app.after(0, lambda: app._lbl_refresh_clusters())
         except Exception as e:
-            app.after(0, lambda: app.wh_status_label.configure(text=f"Lỗi: {str(e)}", text_color="red"))
+            err_msg = str(e)
+            app.after(0, lambda: app.wh_status_label.configure(text=f"Lỗi: {err_msg}", text_color="red"))
         finally:
             app._wh_is_processing = False
 

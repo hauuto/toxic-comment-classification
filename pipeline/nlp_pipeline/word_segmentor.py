@@ -16,6 +16,7 @@ import re
 import threading
 from typing import Optional, Any
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeout
+from .config import VNCORENLP_MAX_CHAR_LENGTH
 
 # One persistent thread for VnCoreNLP calls (JVM is not thread-safe anyway)
 _vncore_executor = ThreadPoolExecutor(max_workers=1)
@@ -62,12 +63,21 @@ def _get_or_create_vncorenlp_model(vncorenlp_dir: str, auto_download: bool) -> A
         return model
 
 
+# Regex to canonicalize spaced emoji tokens: ": tên_liền :" → ":tên_liền:"
+# Must run BEFORE placeholder protection so _PLACEHOLDER_RE can match them.
+_EMOJI_CANON_RE = re.compile(
+    r":\s*([a-zA-Z0-9_àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]+"
+    r"(?:\s*_\s*[a-zA-Z0-9_àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]+)*)\s*:",
+    re.UNICODE | re.IGNORECASE,
+)
+
 # Placeholder pattern: matches placeholder tags like <url>, <mention>, <num>, <ip>...
-# and emoji tokens like :cười_ra_nước_mắt:, as well as English contractions like don't, we're
+# and emoji tokens like :cười_ra_nước_mắt: (NO spaces around colons),
+# as well as English contractions like don't, we're.
 _PLACEHOLDER_RE = re.compile(
     r"<(?:url|mention|hashtag|email|date|time|num|ip)>|"
     r":[a-zA-Z0-9_àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]+:|"
-    r"(?<!\w)[a-zA-Z]+['’][a-zA-Z]+(?!\w)",
+    r"(?<!\w)[a-zA-Z]+[''][a-zA-Z]+(?!\w)",
     re.UNICODE | re.IGNORECASE,
 )
 
@@ -163,6 +173,10 @@ class WordSegmentor:
         """
         Extract placeholders from text, replace with safe markers.
         Returns (protected_text, {marker: original_placeholder}).
+
+        Steps:
+          1. Canonicalize spaced emoji tokens: ": tên :" → ":tên:"
+          2. Protect canonical tokens (:tên:, <URL>, contractions) with markers.
         """
         store = {}
         counter = [0]
@@ -173,7 +187,22 @@ class WordSegmentor:
             counter[0] += 1
             return marker
 
-        protected = _PLACEHOLDER_RE.sub(_replace, text)
+        # Step 1: canonicalize ": name :" → ":name:"
+        def _canon_emoji(m):
+            name = m.group(1)
+            name = re.sub(r"\s*_\s*", "_", name.strip())
+            return f":{name}:"
+
+        canonicalized = _EMOJI_CANON_RE.sub(_canon_emoji, text)
+        # Multi-pass for shared colon boundaries: ": a : b :" → ":a: b :" → ":a: :b:"
+        for _ in range(5):
+            new = _EMOJI_CANON_RE.sub(_canon_emoji, canonicalized)
+            if new == canonicalized:
+                break
+            canonicalized = new
+
+        # Step 2: protect canonical tokens
+        protected = _PLACEHOLDER_RE.sub(_replace, canonicalized)
         return protected, store
 
     def _restore_placeholders(self, text: str, store: dict) -> str:
@@ -207,13 +236,19 @@ class WordSegmentor:
 
             # ---------- VnCoreNLP ----------
             if self.backend_name == "vncorenlp" and self.vncorenlp_model:
+                # Guard: skip VnCoreNLP for very long texts to prevent JVM crash
+                if len(text) > VNCORENLP_MAX_CHAR_LENGTH:
+                    print(f"[WordSegmentor] Skipping VnCoreNLP segmentation: "
+                          f"text too long ({len(text)} chars > {VNCORENLP_MAX_CHAR_LENGTH})")
+                    return text
+
                 _model = self.vncorenlp_model
                 _text  = protected
                 if self._vncore_dead:
                     # JVM is unresponsive — skip segmentation to keep pipeline moving
                     segmented = protected
                 else:
-                    future = _vncore_executor.submit(_model.annotate_text, _text)
+                    future = _vncore_executor.submit(_model.word_segment, _text)
                     try:
                         result = future.result(timeout=30)   # 30s per-row hard limit
                         self._vncore_timeout_streak = 0      # reset on success
@@ -226,13 +261,9 @@ class WordSegmentor:
                             print("[WordSegmentor] VnCoreNLP appears dead — "
                                   "falling back to whitespace for remaining rows")
                         return None
-                    tokens = []
 
-                    # result is dict: {sent_id: [word_info, ...]}
-                    for sentence in result.values():
-                        for word_info in sentence:
-                            tokens.append(word_info["wordForm"])
-                    segmented = " ".join(tokens)
+                    # word_segment returns List[str] — each element is a segmented sentence
+                    segmented = " ".join(result)
 
             # ---------- Underthesea ----------
             elif self.backend_name == "underthesea":
@@ -250,6 +281,9 @@ class WordSegmentor:
 
         except Exception as e:
             err = str(e)
+            # ArrayIndexOutOfBounds: text already has underscores from prior segmentation
+            if "ArrayIndexOutOfBoundsException" in err:
+                return text
             # Java heap space → text too long, silently discard
             if "OutOfMemoryError" in err or "heap space" in err or "JVM exception" in err:
                 return None

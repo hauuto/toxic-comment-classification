@@ -17,6 +17,9 @@ MIN_CHAR_LENGTH = 20          # Minimum characters to keep a comment
 MIN_VIETNAMESE_RATIO = 0.3    # Minimum ratio of Vietnamese chars in text
 MAX_SPAM_REPEAT = 6          # Max consecutive identical chars before flagging as spam
 
+# --- VnCoreNLP limits ---
+VNCORENLP_MAX_CHAR_LENGTH = 8000  # Skip VnCoreNLP segmentation for texts longer than this (prevents JVM crash)
+
 # --- Normalization ---
 MAX_REPEAT_CHARS = 3          # Max allowed consecutive repeated chars in words
 MAX_REPEAT_PUNCTUATION = 3    # Max allowed consecutive repeated punctuation (!, ?, .)
