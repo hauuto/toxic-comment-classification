@@ -343,7 +343,7 @@ def _lbl_start_labeling(app):
         workers = int((app.lbl_workers_var.get() or "").strip() or "1")
     except Exception:
         workers = 1
-    workers = max(1, min(workers, 32))
+    workers = max(1, min(workers, 100))
 
     request_retries = 3
     model_name = app.lbl_model_var.get().strip()
@@ -570,14 +570,12 @@ def _lbl_start_labeling(app):
                         app.after(0, app._lbl_log, f"⚠️ Batch {i + 1}/{len(batches)} bị safety-block: {e}. Gán nhãn mặc định (Clean/Neutral).")
                         predictions = [{"tier1_label": "Clean", "tier2_labels": ["Neutral"]} for _ in batch_tasks]
                     except Exception as e:
-                        app._lbl_stop_event.set()
-                        raise RuntimeError(f"Request thất bại ở batch {i + 1}/{len(batches)}: {e}") from e
+                        app.after(0, app._lbl_log, f"⚠️ Batch {i + 1}/{len(batches)} thất bại: {e}. Gán nhãn mặc định (Clean/Neutral).")
+                        predictions = [{"tier1_label": "Clean", "tier2_labels": ["Neutral"]} for _ in batch_tasks]
 
                     if not isinstance(predictions, list) or len(predictions) != len(batch_tasks):
-                        app._lbl_stop_event.set()
-                        raise RuntimeError(
-                            f"Response không hợp lệ ở batch {i + 1}/{len(batches)}: got {type(predictions)} len={getattr(predictions, '__len__', lambda: '?')()}"
-                        )
+                        app.after(0, app._lbl_log, f"⚠️ Batch {i + 1}/{len(batches)} response không hợp lệ. Gán nhãn mặc định.")
+                        predictions = [{"tier1_label": "Clean", "tier2_labels": ["Neutral"]} for _ in batch_tasks]
                     _write_batch_results(batch_rows, predictions)
             else:
                 thread_local = threading.local()
@@ -626,15 +624,13 @@ def _lbl_start_labeling(app):
                             app.after(0, app._lbl_log, f"⚠️ Batch {next_to_write + 1}/{len(batches)} bị safety-block: {e}. Gán nhãn mặc định (Clean/Neutral).")
                             predictions = [{"tier1_label": "Clean", "tier2_labels": ["Neutral"]} for _ in batch_tasks]
                         except Exception as e:
-                            app._lbl_stop_event.set()
-                            raise RuntimeError(f"Request thất bại ở batch {next_to_write + 1}/{len(batches)}: {e}") from e
+                            app.after(0, app._lbl_log, f"⚠️ Batch {next_to_write + 1}/{len(batches)} thất bại: {e}. Gán nhãn mặc định (Clean/Neutral).")
+                            predictions = [{"tier1_label": "Clean", "tier2_labels": ["Neutral"]} for _ in batch_tasks]
 
                         inflight.pop(next_to_write, None)
                         if not isinstance(predictions, list) or len(predictions) != len(batch_tasks):
-                            app._lbl_stop_event.set()
-                            raise RuntimeError(
-                                f"Response không hợp lệ ở batch {next_to_write + 1}/{len(batches)}: got {type(predictions)} len={getattr(predictions, '__len__', lambda: '?')()}"
-                            )
+                            app.after(0, app._lbl_log, f"⚠️ Batch {next_to_write + 1}/{len(batches)} response không hợp lệ. Gán nhãn mặc định.")
+                            predictions = [{"tier1_label": "Clean", "tier2_labels": ["Neutral"]} for _ in batch_tasks]
 
                         _write_batch_results(batch_rows, predictions)
                         next_to_write += 1

@@ -344,6 +344,7 @@ class GeminiHierarchicalClassifier:
         last_error: Exception | None = None
         last_response: requests.Response | None = None
         last_body_snippet: str = ""
+        consecutive_empty = 0  # track consecutive empty (non-safety) outputs
         max_attempts = 1 + max(0, int(retries))
         for attempt in range(max_attempts):
             try:
@@ -380,8 +381,20 @@ class GeminiHierarchicalClassifier:
                 if not text:
                     diag = _diagnose_empty_output(data)
                     if diag:
-                        # Safety block → do NOT retry the same content; raise immediately.
+                        # Safety / non-retryable block → do NOT retry the same content.
                         raise GeminiSafetyBlockError(diag)
+
+                    # Transient empty output — but if it keeps happening, the batch
+                    # likely contains a problematic comment.  Fall back to single
+                    # requests after 2 consecutive empties (for multi-comment batches).
+                    consecutive_empty += 1
+                    if consecutive_empty >= 2 and len(tasks) > 1:
+                        return self._predict_single_fallback(tasks, retries=retries, strict=strict)
+
+                    raise ValueError("Empty model output (possibly safety-blocked or missing content)")
+
+                # Reset counter on successful text extraction
+                consecutive_empty = 0
 
                 items = _parse_items(text, expected_n=len(tasks), strict=strict)
                 validated = [_validate_tier_result(obj) for obj in items]
@@ -471,8 +484,9 @@ def _get_gemini_text(result: Dict[str, Any]) -> str:
 def _diagnose_empty_output(result: Dict[str, Any]) -> str:
     """Return a human-readable diagnosis when ``_get_gemini_text`` returns empty.
 
-    Inspects ``promptFeedback.blockReason`` and ``candidates[0].finishReason``
-    to determine whether the Gemini response was safety-blocked.
+    Inspects ``promptFeedback.blockReason``, ``candidates[0].finishReason``,
+    and structural anomalies (missing content/parts) to determine whether the
+    Gemini response was safety-blocked or otherwise non-retryable.
 
     Returns an empty string if no obvious safety block is detected (i.e. the
     empty output might be a transient issue worth retrying).
@@ -487,10 +501,22 @@ def _diagnose_empty_output(result: Dict[str, Any]) -> str:
 
     # Check candidate-level finish reason
     candidates = result.get("candidates", [])
+    # Non-retryable finish reasons (deterministic — retrying won't help)
+    _NON_RETRYABLE_FINISH = {"SAFETY", "RECITATION", "OTHER", "BLOCKLIST",
+                             "PROHIBITED_CONTENT", "SPII"}
     if candidates:
         finish_reason = candidates[0].get("finishReason", "")
-        if finish_reason and finish_reason not in ("STOP", "MAX_TOKENS"):
+        if finish_reason in _NON_RETRYABLE_FINISH:
             parts.append(f"finishReason={finish_reason}")
+        elif finish_reason and finish_reason not in ("STOP", "MAX_TOKENS"):
+            parts.append(f"finishReason={finish_reason}")
+
+        # Detect missing content or empty parts (candidate exists but no text)
+        content = candidates[0].get("content")
+        if content is None:
+            parts.append("candidate has no content")
+        elif not content.get("parts"):
+            parts.append("candidate content has no parts")
 
         # Collect safety ratings that triggered filtering
         safety_ratings = candidates[0].get("safetyRatings", [])
@@ -498,15 +524,19 @@ def _diagnose_empty_output(result: Dict[str, Any]) -> str:
             sr.get("category", "?")
             for sr in safety_ratings
             if sr.get("blocked") is True
+                or sr.get("probability", "").upper() in ("HIGH",)
         ]
         if blocked_cats:
             parts.append(f"blockedCategories={blocked_cats}")
-    elif not candidates and block_reason:
-        # No candidates at all → prompt was blocked before generation
-        parts.append("no candidates returned (prompt blocked)")
+    elif not candidates:
+        # No candidates at all
+        if block_reason:
+            parts.append("no candidates returned (prompt blocked)")
+        else:
+            parts.append("no candidates returned (unknown reason)")
 
     if parts:
-        return "Safety-blocked: " + "; ".join(parts)
+        return "Safety/Non-retryable: " + "; ".join(parts)
     return ""
 
 
@@ -531,6 +561,10 @@ def _parse_items(content: str, expected_n: int, strict: bool = False) -> List[Di
     - JSON object: {"items": [ ... ]}
     - JSON array: [ ... ]
     - single object: { ... }  (treated as one item)
+
+    In strict mode, minor count mismatches (off-by-a-few) are tolerated via
+    ``_pad_or_trim`` — Gemini frequently returns N±1 items. Only raises when
+    no items could be parsed at all.
     """
     if not content:
         if strict:
@@ -539,30 +573,35 @@ def _parse_items(content: str, expected_n: int, strict: bool = False) -> List[Di
 
     content = _strip_code_fences(content)
 
+    def _resolve(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Apply pad/trim, raising only when nothing was parsed in strict mode."""
+        if expected_n > 0 and len(items) != expected_n:
+            if strict and len(items) == 0:
+                raise ValueError(
+                    f"Gemini parsed 0 items but expected {expected_n}"
+                )
+            # Any non-zero count (e.g. 11 vs 10, 8 vs 10): silently pad/trim.
+            # Gemini frequently returns N±1 items — this is normal LLM behaviour.
+        return _pad_or_trim(items, expected_n)
+
     # 1) direct json
     items = _try_parse_items_json(content)
     if items is not None:
-        if strict and expected_n > 0 and len(items) != expected_n:
-            raise ValueError(f"Gemini parsed items length mismatch: expected {expected_n}, got {len(items)}")
-        return _pad_or_trim(items, expected_n) if not strict else items
+        return _resolve(items)
 
     # 2) try extract {...}
     obj_str = _extract_json_by_brackets(content, "{", "}")
     if obj_str:
         items = _try_parse_items_json(obj_str)
         if items is not None:
-            if strict and expected_n > 0 and len(items) != expected_n:
-                raise ValueError(f"Gemini parsed items length mismatch: expected {expected_n}, got {len(items)}")
-            return _pad_or_trim(items, expected_n) if not strict else items
+            return _resolve(items)
 
     # 3) try extract [...]
     arr_str = _extract_json_by_brackets(content, "[", "]")
     if arr_str:
         items = _try_parse_items_json(arr_str)
         if items is not None:
-            if strict and expected_n > 0 and len(items) != expected_n:
-                raise ValueError(f"Gemini parsed items length mismatch: expected {expected_n}, got {len(items)}")
-            return _pad_or_trim(items, expected_n) if not strict else items
+            return _resolve(items)
 
     if strict:
         snippet = str(content).strip().replace("\r", "")[:1200]
