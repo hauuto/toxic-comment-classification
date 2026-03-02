@@ -220,6 +220,9 @@ chrome_profile_threads/
 
 models/
 
+*.pth
+*.npy
+
 
 
 *.csv

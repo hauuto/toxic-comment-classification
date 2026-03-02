@@ -112,18 +112,19 @@ class VietnameseCommentPreprocessor:
             else:
                 self.segmentor = WordSegmentor(backend="whitespace")
 
-    def process_comment(self, text: str, 
-                        use_decoder: bool = True, 
-                        use_filter: bool = True, 
-                        use_normalizer: bool = True,
-                        use_segmentor: bool = True) -> dict:
-        """
-        Process a single comment through the pipeline.
-        Returns a dictionary containing:
-        - raw_text: Original text passed in.
-        - cleaned_text: Fully decoded and normalized text.
-        - filter_reason: Why it was dropped (or "ok" if kept).
-        - is_valid: True if it passes the filters, False otherwise.
+    def process_comment_no_segment(
+        self,
+        text: str,
+        use_decoder: bool = True,
+        use_filter: bool = True,
+        use_normalizer: bool = True,
+    ) -> dict:
+        """Run Decode → Filter → Normalize (steps 1–3.5) WITHOUT segmentation.
+
+        This is safe to call from multiple processes in parallel because it
+        only uses stateless regex / dict-lookup operations.
+
+        Returns the same dict shape as ``process_comment``.
         """
         if not text or not text.strip():
             return {"raw_text": text, "cleaned_text": "", "filter_reason": "empty", "is_valid": False}
@@ -168,6 +169,42 @@ class VietnameseCommentPreprocessor:
             except Exception:
                 pass  # Non-critical: if it fails, just use the text as-is
 
+        # Canonicalize placeholders (safe pre-segmentation snapshot)
+        current_text = _canonicalize_placeholders(current_text)
+
+        return {
+            "raw_text": text,
+            "cleaned_text": current_text,
+            "filter_reason": reason,
+            "is_valid": True
+        }
+
+    def process_comment(self, text: str,
+                        use_decoder: bool = True,
+                        use_filter: bool = True,
+                        use_normalizer: bool = True,
+                        use_segmentor: bool = True) -> dict:
+        """
+        Process a single comment through the full pipeline.
+        Returns a dictionary containing:
+        - raw_text: Original text passed in.
+        - cleaned_text: Fully decoded and normalized text.
+        - filter_reason: Why it was dropped (or "ok" if kept).
+        - is_valid: True if it passes the filters, False otherwise.
+        """
+        # Steps 1–3.5: Decode → Filter → Normalize
+        result = self.process_comment_no_segment(
+            text,
+            use_decoder=use_decoder,
+            use_filter=use_filter,
+            use_normalizer=use_normalizer,
+        )
+
+        if not result["is_valid"]:
+            return result
+
+        current_text = result["cleaned_text"]
+
         # 4. Segment
         if use_segmentor:
             try:
@@ -184,9 +221,5 @@ class VietnameseCommentPreprocessor:
         # 5. Canonicalize placeholder tags (AFTER segmentation)
         current_text = _canonicalize_placeholders(current_text)
 
-        return {
-            "raw_text": text, 
-            "cleaned_text": current_text, 
-            "filter_reason": reason, 
-            "is_valid": True
-        }
+        result["cleaned_text"] = current_text
+        return result

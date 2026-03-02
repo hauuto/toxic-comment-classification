@@ -174,14 +174,9 @@ class Tokenizer:
 
             # ---------- VnCoreNLP ----------
             if self.backend_name == "vncorenlp" and self.vncorenlp_model:
-                result = self.vncorenlp_model.annotate_text(protected)
-                tokens = []
-
-                # result is dict: {sent_id: [word_info, ...]}
-                for sentence in result.values():
-                    for word_info in sentence:
-                        tokens.append(word_info["wordForm"])
-                tokenized = " ".join(tokens)
+                # word_segment returns List[str] — each element is a segmented sentence
+                sentences = self.vncorenlp_model.word_segment(protected)
+                tokenized = " ".join(sentences)
 
             # ---------- Underthesea ----------
             elif self.backend_name == "underthesea":

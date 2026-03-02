@@ -7,12 +7,11 @@ import customtkinter as ctk
 from tkinter import messagebox, ttk
 
 from google_drive import download_labeled_data, upload_labeled_data
-from lmstudio_classifier import (
+from gemini_hierarchical_classifier import (
     TIER1_LABELS,
-    TIER2_LABELS,
-    TIER3_ALL_LABELS,
-    TIER3_CLEAN_LABELS,
-    TIER3_TOXIC_LABELS,
+    TIER2_ALL_LABELS,
+    TIER2_CLEAN_LABELS,
+    TIER2_TOXIC_LABELS,
 )
 
 
@@ -51,18 +50,8 @@ def _setup_label_manager_tab(app):
     app.lm_t2_filter_var = ctk.StringVar(value="Tất cả")
     ctk.CTkOptionMenu(
         row1,
-        values=["Tất cả"] + TIER2_LABELS,
+        values=["Tất cả"] + TIER2_ALL_LABELS,
         variable=app.lm_t2_filter_var,
-        command=lambda _: app._lm_filter_data(),
-        width=100,
-    ).pack(side="left", padx=2)
-
-    ctk.CTkLabel(row1, text="Tier3:").pack(side="left", padx=(8, 3))
-    app.lm_t3_filter_var = ctk.StringVar(value="Tất cả")
-    ctk.CTkOptionMenu(
-        row1,
-        values=["Tất cả"] + TIER3_ALL_LABELS,
-        variable=app.lm_t3_filter_var,
         command=lambda _: app._lm_filter_data(),
         width=120,
     ).pack(side="left", padx=2)
@@ -89,10 +78,7 @@ def _setup_label_manager_tab(app):
     ctk.CTkOptionMenu(row2, values=["—"] + TIER1_LABELS, variable=app.lm_edit_t1_var, width=95).pack(side="left", padx=2)
     ctk.CTkLabel(row2, text="T2:").pack(side="left", padx=(5, 2))
     app.lm_edit_t2_var = ctk.StringVar(value="—")
-    ctk.CTkOptionMenu(row2, values=["—"] + TIER2_LABELS, variable=app.lm_edit_t2_var, width=85).pack(side="left", padx=2)
-    ctk.CTkLabel(row2, text="T3:").pack(side="left", padx=(5, 2))
-    app.lm_edit_t3_var = ctk.StringVar(value="—")
-    ctk.CTkOptionMenu(row2, values=["—"] + TIER3_ALL_LABELS, variable=app.lm_edit_t3_var, width=120).pack(side="left", padx=2)
+    ctk.CTkOptionMenu(row2, values=["—"] + TIER2_ALL_LABELS, variable=app.lm_edit_t2_var, width=120).pack(side="left", padx=2)
     ctk.CTkButton(
         row2,
         text="Áp dụng",
@@ -140,20 +126,18 @@ def _setup_label_manager_tab(app):
     tf.grid_rowconfigure(0, weight=1)
     app.lm_tree = ttk.Treeview(
         tf,
-        columns=("id", "text", "tier1", "tier2", "tier3"),
+        columns=("id", "text", "tier1", "tier2"),
         show="headings",
         selectmode="extended",
     )
     app.lm_tree.heading("id", text="ID")
     app.lm_tree.heading("text", text="Nội dung bình luận")
-    app.lm_tree.heading("tier1", text="Tier1 Spam")
-    app.lm_tree.heading("tier2", text="Tier2 Toxic")
-    app.lm_tree.heading("tier3", text="Tier3 Labels")
+    app.lm_tree.heading("tier1", text="Tier1 Toxic")
+    app.lm_tree.heading("tier2", text="Tier2 Labels")
     app.lm_tree.column("id", width=40, anchor="center")
-    app.lm_tree.column("text", width=300, anchor="w")
+    app.lm_tree.column("text", width=350, anchor="w")
     app.lm_tree.column("tier1", width=80, anchor="center")
-    app.lm_tree.column("tier2", width=80, anchor="center")
-    app.lm_tree.column("tier3", width=130, anchor="center")
+    app.lm_tree.column("tier2", width=160, anchor="center")
     lm_scroll = ttk.Scrollbar(tf, orient="vertical", command=app.lm_tree.yview)
     app.lm_tree.configure(yscrollcommand=lm_scroll.set)
     app.lm_tree.grid(row=0, column=0, sticky="nsew")
@@ -173,19 +157,6 @@ def _setup_label_manager_tab(app):
     app._lm_load_data()
 
 
-def _migrate_old_label(old_label: str):
-    """Migrate old single-label format to 3-tier. Returns (tier1, tier2, tier3_str)."""
-    old_label = old_label.strip()
-    if old_label == "Spam":
-        return "Spam", "Clean", "Neutral"
-    elif old_label in ("Hate Speech", "Harassment", "Obscene"):
-        return "Not Spam", "Toxic", old_label
-    elif old_label == "Clean":
-        return "Not Spam", "Clean", "Neutral"
-    else:
-        return "Not Spam", "Clean", "Neutral"
-
-
 def _lm_load_data(app):
     labeled_path = app._get_labeled_data_path()
     app._lm_all_rows = []
@@ -193,7 +164,6 @@ def _lm_load_data(app):
         try:
             raw_rows, fieldnames, enc_used = app._read_csv_dicts_with_fallback(labeled_path)
             # Auto-convert only when we are reasonably confident (cp1258/cp1252).
-            # Avoid destructive conversions from latin-1 or utf-8(replace).
             if enc_used in ("cp1258", "cp1252"):
                 bak = app._backup_file(labeled_path)
                 app._rewrite_csv_utf8sig(labeled_path, raw_rows, fieldnames)
@@ -221,30 +191,14 @@ def _lm_load_data(app):
             for row in raw_rows:
                 if isinstance(row, dict):
                     row = app._sanitize_csv_row(row)
-                # New 3-tier format
-                if "tier1_spam" in row:
-                    app._lm_all_rows.append(
-                        {
-                            "id": row.get("id", ""),
-                            "text": row.get("text", ""),
-                            "tier1_spam": row.get("tier1_spam", "Not Spam"),
-                            "tier2_toxic": row.get("tier2_toxic", "Clean"),
-                            "tier3_labels": row.get("tier3_labels", ""),
-                        }
-                    )
-                else:
-                    # Backward compatibility: migrate old format (id, text, label)
-                    old_label = row.get("label", "Clean")
-                    t1, t2, t3 = app._migrate_old_label(str(old_label))
-                    app._lm_all_rows.append(
-                        {
-                            "id": row.get("id", ""),
-                            "text": row.get("text", ""),
-                            "tier1_spam": t1,
-                            "tier2_toxic": t2,
-                            "tier3_labels": t3,
-                        }
-                    )
+                app._lm_all_rows.append(
+                    {
+                        "id": row.get("id", ""),
+                        "text": row.get("text", ""),
+                        "tier1_label": row.get("tier1_label", "Clean"),
+                        "tier2_labels": row.get("tier2_labels", ""),
+                    }
+                )
         except Exception as e:
             messagebox.showerror("Lỗi", f"Không thể đọc labeled_data.csv: {e}")
 
@@ -266,9 +220,8 @@ def _lm_display_rows(app, rows):
             values=(
                 row.get("id", ""),
                 str(row.get("text", "")).replace("\n", "  "),
-                row.get("tier1_spam", ""),
-                row.get("tier2_toxic", ""),
-                row.get("tier3_labels", ""),
+                row.get("tier1_label", ""),
+                row.get("tier2_labels", ""),
             ),
         )
 
@@ -277,16 +230,13 @@ def _lm_filter_data(app):
     query = app.lm_search_var.get().strip().lower()
     t1_filter = app.lm_t1_filter_var.get()
     t2_filter = app.lm_t2_filter_var.get()
-    t3_filter = app.lm_t3_filter_var.get()
     filtered = app._lm_all_rows
     if query:
         filtered = [r for r in filtered if query in r.get("text", "").lower()]
     if t1_filter != "Tất cả":
-        filtered = [r for r in filtered if r.get("tier1_spam", "") == t1_filter]
+        filtered = [r for r in filtered if r.get("tier1_label", "") == t1_filter]
     if t2_filter != "Tất cả":
-        filtered = [r for r in filtered if r.get("tier2_toxic", "") == t2_filter]
-    if t3_filter != "Tất cả":
-        filtered = [r for r in filtered if t3_filter in r.get("tier3_labels", "").split("|")]
+        filtered = [r for r in filtered if t2_filter in r.get("tier2_labels", "").split("|")]
     _lm_display_rows(app, filtered)
     app.lm_status_label.configure(text=f"Hiển thị {len(filtered)}/{len(app._lm_all_rows)} dòng", text_color="blue")
 
@@ -295,7 +245,6 @@ def _lm_clear_filter(app):
     app.lm_search_var.set("")
     app.lm_t1_filter_var.set("Tất cả")
     app.lm_t2_filter_var.set("Tất cả")
-    app.lm_t3_filter_var.set("Tất cả")
     _lm_display_rows(app, app._lm_all_rows)
     app.lm_status_label.configure(text=f"Hiển thị tất cả {len(app._lm_all_rows)} dòng", text_color="green")
 
@@ -304,7 +253,7 @@ def _lm_save_data(app):
     labeled_path = app._get_labeled_data_path()
     try:
         with open(labeled_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=["id", "text", "tier1_spam", "tier2_toxic", "tier3_labels"])
+            writer = csv.DictWriter(f, fieldnames=["id", "text", "tier1_label", "tier2_labels"])
             writer.writeheader()
             writer.writerows(app._lm_all_rows)
     except Exception as e:
@@ -338,9 +287,8 @@ def _lm_edit_label(app):
         return
     new_t1 = app.lm_edit_t1_var.get()
     new_t2 = app.lm_edit_t2_var.get()
-    new_t3 = app.lm_edit_t3_var.get()
-    if new_t1 == "—" and new_t2 == "—" and new_t3 == "—":
-        messagebox.showwarning("Nhắc nhở", "Hãy chọn ít nhất 1 tier để sửa (T1, T2, hoặc T3).")
+    if new_t1 == "—" and new_t2 == "—":
+        messagebox.showwarning("Nhắc nhở", "Hãy chọn ít nhất 1 tier để sửa (T1 hoặc T2).")
         return
     ids_to_edit = set()
     for item in selected:
@@ -351,21 +299,19 @@ def _lm_edit_label(app):
     for row in app._lm_all_rows:
         if str(row["id"]) in ids_to_edit:
             if new_t1 != "—":
-                row["tier1_spam"] = new_t1
+                row["tier1_label"] = new_t1
+                # If changing tier1, clear incompatible tier2 labels
+                current_t2 = row.get("tier2_labels", "").split("|") if row.get("tier2_labels") else []
+                valid_pool = TIER2_TOXIC_LABELS if new_t1 == "Toxic" else TIER2_CLEAN_LABELS
+                compatible = [lbl for lbl in current_t2 if lbl in valid_pool]
+                row["tier2_labels"] = "|".join(compatible)
             if new_t2 != "—":
-                row["tier2_toxic"] = new_t2
-                # If changing tier2, clear tier3 if incompatible
-                current_t3 = row.get("tier3_labels", "").split("|") if row.get("tier3_labels") else []
-                valid_pool = TIER3_TOXIC_LABELS if new_t2 == "Toxic" else TIER3_CLEAN_LABELS
-                compatible = [lbl for lbl in current_t3 if lbl in valid_pool]
-                row["tier3_labels"] = "|".join(compatible)
-            if new_t3 != "—":
-                # Append or replace tier3
-                current_t3 = row.get("tier3_labels", "").split("|") if row.get("tier3_labels") else []
-                current_t3 = [lbl for lbl in current_t3 if lbl]
-                if new_t3 not in current_t3:
-                    current_t3.append(new_t3)
-                row["tier3_labels"] = "|".join(current_t3)
+                # Append tier2 label
+                current_t2 = row.get("tier2_labels", "").split("|") if row.get("tier2_labels") else []
+                current_t2 = [lbl for lbl in current_t2 if lbl]
+                if new_t2 not in current_t2:
+                    current_t2.append(new_t2)
+                row["tier2_labels"] = "|".join(current_t2)
             changed += 1
     _lm_save_data(app)
     _lm_display_rows(app, app._lm_all_rows)
@@ -374,9 +320,7 @@ def _lm_edit_label(app):
     if new_t1 != "—":
         parts.append(f"T1→{new_t1}")
     if new_t2 != "—":
-        parts.append(f"T2→{new_t2}")
-    if new_t3 != "—":
-        parts.append(f"T3+={new_t3}")
+        parts.append(f"T2+={new_t2}")
     app.lm_status_label.configure(text=f"Đã sửa {changed} dòng: {', '.join(parts)}", text_color="green")
 
 
@@ -388,7 +332,7 @@ def _lm_export_csv(app):
     export_path = os.path.join(os.getcwd(), f"labeled_export_{timestamp}.csv")
     try:
         with open(export_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=["id", "text", "tier1_spam", "tier2_toxic", "tier3_labels"])
+            writer = csv.DictWriter(f, fieldnames=["id", "text", "tier1_label", "tier2_labels"])
             writer.writeheader()
             writer.writerows(app._lm_all_rows)
         messagebox.showinfo("Thành công", f"Đã xuất {len(app._lm_all_rows)} dòng ra:\n{os.path.basename(export_path)}")
@@ -411,37 +355,34 @@ def _lm_update_chart(app):
     total = len(app._lm_all_rows)
 
     # Count tiers
-    t1_counts = {"Spam": 0, "Not Spam": 0}
-    t2_counts = {"Toxic": 0, "Clean": 0}
-    t3_counts = {}
-    for lbl in TIER3_ALL_LABELS:
-        t3_counts[lbl] = 0
+    t1_counts = {"Toxic": 0, "Clean": 0}
+    t2_counts = {}
+    for lbl in TIER2_ALL_LABELS:
+        t2_counts[lbl] = 0
 
     for row in app._lm_all_rows:
-        t1 = row.get("tier1_spam", "Not Spam")
-        t2 = row.get("tier2_toxic", "Clean")
+        t1 = row.get("tier1_label", "Clean")
         t1_counts[t1] = t1_counts.get(t1, 0) + 1
-        t2_counts[t2] = t2_counts.get(t2, 0) + 1
-        t3_str = row.get("tier3_labels", "")
-        if t3_str:
-            for lbl in t3_str.split("|"):
+        t2_str = row.get("tier2_labels", "")
+        if t2_str:
+            for lbl in t2_str.split("|"):
                 lbl = lbl.strip()
                 if lbl:
-                    t3_counts[lbl] = t3_counts.get(lbl, 0) + 1
+                    t2_counts[lbl] = t2_counts.get(lbl, 0) + 1
 
     if app._lm_canvas:
         app._lm_canvas.get_tk_widget().destroy()
         app._lm_canvas = None
 
     bg_color = "#2B2B2B"
-    fig = Figure(figsize=(5, 6), dpi=90, facecolor=bg_color)
+    fig = Figure(figsize=(5, 5), dpi=90, facecolor=bg_color)
 
     # --- Tier 1: Pie ---
-    ax1 = fig.add_subplot(3, 1, 1)
+    ax1 = fig.add_subplot(2, 1, 1)
     ax1.set_facecolor(bg_color)
     t1_labels = list(t1_counts.keys())
     t1_values = list(t1_counts.values())
-    t1_colors = ["#F59E0B", "#22C55E"]
+    t1_colors = ["#EF4444", "#22C55E"]
     if sum(t1_values) > 0:
         wedges, texts, autotexts = ax1.pie(
             t1_values,
@@ -454,36 +395,17 @@ def _lm_update_chart(app):
         for at in autotexts:
             at.set_fontsize(7)
     ax1.set_title(
-        f"Tier 1 – Spam Check (n={total})",
+        f"Tier 1 – Toxic Check (n={total})",
         fontsize=10,
         color="white",
         fontweight="bold",
         pad=5,
     )
 
-    # --- Tier 2: Pie ---
-    ax2 = fig.add_subplot(3, 1, 2)
+    # --- Tier 2: Horizontal bar ---
+    ax2 = fig.add_subplot(2, 1, 2)
     ax2.set_facecolor(bg_color)
-    t2_labels = list(t2_counts.keys())
-    t2_values = list(t2_counts.values())
-    t2_colors = ["#EF4444", "#22C55E"]
-    if sum(t2_values) > 0:
-        wedges2, texts2, autotexts2 = ax2.pie(
-            t2_values,
-            labels=t2_labels,
-            colors=t2_colors,
-            autopct="%1.0f%%",
-            startangle=90,
-            textprops={"color": "white", "fontsize": 8},
-        )
-        for at in autotexts2:
-            at.set_fontsize(7)
-    ax2.set_title("Tier 2 – Toxic Check", fontsize=10, color="white", fontweight="bold", pad=5)
-
-    # --- Tier 3: Horizontal bar ---
-    ax3 = fig.add_subplot(3, 1, 3)
-    ax3.set_facecolor(bg_color)
-    t3_color_map = {
+    t2_color_map = {
         "Hate Speech": "#EF4444",
         "Harassment": "#8B5CF6",
         "Obscene": "#EC4899",
@@ -491,14 +413,14 @@ def _lm_update_chart(app):
         "Negative": "#F59E0B",
         "Neutral": "#6B7280",
     }
-    t3_labels = list(t3_counts.keys())
-    t3_values = list(t3_counts.values())
-    t3_colors = [t3_color_map.get(lbl, "#6B7280") for lbl in t3_labels]
-    bars = ax3.barh(t3_labels, t3_values, color=t3_colors, edgecolor="#444", height=0.55)
-    max_val = max(t3_values) if t3_values and max(t3_values) > 0 else 1
-    for bar, val in zip(bars, t3_values):
+    t2_labels = list(t2_counts.keys())
+    t2_values = list(t2_counts.values())
+    t2_colors = [t2_color_map.get(lbl, "#6B7280") for lbl in t2_labels]
+    bars = ax2.barh(t2_labels, t2_values, color=t2_colors, edgecolor="#444", height=0.55)
+    max_val = max(t2_values) if t2_values and max(t2_values) > 0 else 1
+    for bar, val in zip(bars, t2_values):
         if val > 0:
-            ax3.text(
+            ax2.text(
                 bar.get_width() + max_val * 0.02,
                 bar.get_y() + bar.get_height() / 2,
                 str(val),
@@ -508,14 +430,14 @@ def _lm_update_chart(app):
                 color="white",
                 fontweight="bold",
             )
-    ax3.set_title("Tier 3 – Multi-label", fontsize=10, color="white", fontweight="bold", pad=5)
-    ax3.tick_params(colors="white", labelsize=7)
-    ax3.spines["top"].set_visible(False)
-    ax3.spines["right"].set_visible(False)
-    ax3.spines["bottom"].set_color("#555")
-    ax3.spines["left"].set_color("#555")
+    ax2.set_title("Tier 2 – Multi-label", fontsize=10, color="white", fontweight="bold", pad=5)
+    ax2.tick_params(colors="white", labelsize=7)
+    ax2.spines["top"].set_visible(False)
+    ax2.spines["right"].set_visible(False)
+    ax2.spines["bottom"].set_color("#555")
+    ax2.spines["left"].set_color("#555")
     if max_val > 0:
-        ax3.set_xlim(0, max_val * 1.25)
+        ax2.set_xlim(0, max_val * 1.25)
 
     fig.tight_layout(pad=1.5)
     app._lm_canvas = FigureCanvasTkAgg(fig, master=app.lm_chart_frame)
