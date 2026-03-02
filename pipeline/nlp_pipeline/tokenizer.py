@@ -91,7 +91,9 @@ class Tokenizer:
                             pass
 
                     self.vncorenlp_model = py_vncorenlp.VnCoreNLP(
-                        save_dir=vncorenlp_dir
+                        max_heap_size=os.environ.get("VNCORENLP_MAX_HEAP", "-Xmx2g"),
+                        annotators=["wseg"],
+                        save_dir=vncorenlp_dir,
                     )
 
                     print(f"[Tokenizer] Using py_vncorenlp at: {vncorenlp_dir}")

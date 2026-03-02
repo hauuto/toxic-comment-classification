@@ -95,6 +95,21 @@ class Normalizer:
             re.compile(r"(?:năm\s+)(?:19|20)\d{2}\b", re.IGNORECASE),
         ]
 
+        # Short date formats like dd/mm (no year).
+        # Example: "12/10" should be treated as <date> rather than <num>/<num>.
+        # We avoid matching dd/mm/yyyy by requiring NOT followed by "/yyyy".
+        self._short_date_slash = re.compile(
+            r"\b(?P<d>\d{1,2})\s*/\s*(?P<m>\d{1,2})\b(?!\s*/\s*\d{2,4}\b)",
+            re.UNICODE,
+        )
+
+        # If the text already contains placeholders like <NUM>/<NUM>, treat it as <DATE>.
+        # This helps when older data or upstream systems already normalized numbers.
+        self._short_date_placeholder = re.compile(
+            r"<\s*num\s*>\s*/\s*<\s*num\s*>",
+            re.IGNORECASE | re.UNICODE,
+        )
+
         # Timestamp pattern: 12:30, 1:45:00 (from 2-Preprocessing.ipynb)
         self._timestamp_pattern = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
 
@@ -156,17 +171,36 @@ class Normalizer:
         # We protect them by temporarily replacing with safe tokens during processing.
         # Also protect emoji/icon tokens in the form :token: so abbreviation expansion
         # cannot rewrite inside them (e.g. ":v:" should NOT become ":vậy:").
+        # Also protect custom special-icon tokens wrapped in @@...@@ (and @@ alone).
         self._protected_token_pattern = re.compile(
-            r"<(?:url|mention|hashtag|email|date|time|num|ip)>|:[\w]+:",
+            r"<(?:url|mention|hashtag|email|date|time|num|ip)>|:[\w]+:|@@[^\s@]{1,64}@@|@@+",
             re.IGNORECASE | re.UNICODE,
         )
+
+    @staticmethod
+    def _base26(n: int) -> str:
+        """Encode non-negative int to a-z base26 string (no digits).
+
+        We avoid digits in protection markers because some normalizers/tokenizers
+        (e.g. Underthesea) can split alnum sequences in unexpected ways.
+        """
+        if n < 0:
+            raise ValueError("n must be non-negative")
+        alphabet = "abcdefghijklmnopqrstuvwxyz"
+        if n == 0:
+            return "a"
+        out = []
+        while n:
+            n, r = divmod(n, 26)
+            out.append(alphabet[r])
+        return "".join(reversed(out))
 
     def _protect_tokens(self, text: str):
         tokens = {}
         counter = [0]
 
         def _protect(m):
-            key = f"xptx{counter[0]}xptx"  # already lowercase
+            key = f"xptx{self._base26(counter[0])}xptx"  # already lowercase, no digits
             tokens[key] = m.group()
             counter[0] += 1
             return key
@@ -240,6 +274,22 @@ class Normalizer:
 
     def normalize_dates(self, text: str) -> str:
         """Replace date expressions with <date> token."""
+        # Fix legacy placeholder form first
+        text = self._short_date_placeholder.sub("<date>", text)
+
+        # Handle short dd/mm (no year)
+        def _short_date_repl(m: re.Match) -> str:
+            try:
+                d = int(m.group("d"))
+                mo = int(m.group("m"))
+                if 1 <= d <= 31 and 1 <= mo <= 12:
+                    return "<date>"
+            except Exception:
+                pass
+            return m.group(0)
+
+        text = self._short_date_slash.sub(_short_date_repl, text)
+
         for pattern in self._date_patterns:
             text = pattern.sub("<date>", text)
         return text
@@ -276,24 +326,38 @@ class Normalizer:
 
     def normalize(self, text: str) -> str:
         """Run full normalization pipeline."""
+        # Special-case legacy placeholder form early. If we protect <num> tokens
+        # too soon, the <num>/<num> -> <date> rule would never fire.
+        text = self._short_date_placeholder.sub("<date>", text)
+
+        # Protect placeholders/icon tokens early so they survive mention handling,
+        # punctuation/whitespace normalization, and (optionally) Underthesea.
+        # This is critical for custom tokens like @@...@@.
+        protected, protected_tokens = self._protect_tokens(text)
+
         # NFC first: handle decomposed Unicode from copy-paste/editors
-        text = self.normalize_unicode(text)
+        protected = self.normalize_unicode(protected)
         # IPs first (before URLs and numbers to avoid mangling)
-        text = self.normalize_ips(text)
+        protected = self.normalize_ips(protected)
         # Order matters: emails before URLs (emails contain @, URLs don't)
-        text = self.normalize_emails(text)
-        text = self.normalize_urls(text)
-        text = self.normalize_mentions(text)
-        text = self.normalize_hashtags(text)
-        text = self.normalize_dates(text)
-        text = self.normalize_timestamps(text)
-        text = self.normalize_via_signatures(text)
-        text = self.normalize_char_elongation(text)
-        text = self.normalize_punctuation(text)
-        text = self.normalize_numbers(text)
-        text = self.normalize_case(text)
-        text = self.normalize_abbreviations(text)
-        text = self.normalize_whitespace(text)
+        protected = self.normalize_emails(protected)
+        protected = self.normalize_urls(protected)
+        protected = self.normalize_mentions(protected)
+        protected = self.normalize_hashtags(protected)
+        protected = self.normalize_dates(protected)
+        protected = self.normalize_timestamps(protected)
+        protected = self.normalize_via_signatures(protected)
+        protected = self.normalize_char_elongation(protected)
+        protected = self.normalize_punctuation(protected)
+        protected = self.normalize_numbers(protected)
+        protected = self.normalize_case(protected)
+        protected = self.normalize_abbreviations(protected)
+        protected = self.normalize_whitespace(protected)
         if _underthesea_text_normalize is not None:
-            text = _underthesea_text_normalize(text)
-        return text
+            protected = _underthesea_text_normalize(protected)
+            protected = self.normalize_whitespace(protected)
+
+        # Restore protected tokens at the end so nothing mutates them.
+        for key, val in protected_tokens.items():
+            protected = protected.replace(key, val)
+        return protected

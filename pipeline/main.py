@@ -34,6 +34,7 @@ from ui_tabs import auto_labeling_tab as _auto_labeling_tab
 from ui_tabs import crawler_tab as _crawler_tab
 from ui_tabs import keyword_tab as _keyword_tab
 from ui_tabs import warehouse_tab as _warehouse_tab
+from ui_tabs import giadinh_tab as _giadinh_tab
 from ui_tabs import label_manager_tab as _label_manager_tab
 from ui_tabs import file_manager_tab as _file_manager_tab
 from ui_tabs import config_manager_tab as _config_manager_tab
@@ -143,6 +144,7 @@ class App(ctk.CTk):
         self.tab_crawler = self.tabview.add("Facebook Crawler")
         self.tab_keyword = self.tabview.add("Keyword Crawler")
         self.tab_warehouse = self.tabview.add("Warehouse Manager")
+        self.tab_giadinh = self.tabview.add("Gia đình")
         self.tab_labeling = self.tabview.add("Auto Labeling")
         self.tab_label_mgr = self.tabview.add("Label Manager")
         self.tab_files = self.tabview.add("File Manager")
@@ -152,6 +154,7 @@ class App(ctk.CTk):
         self._setup_crawler_tab()
         self._setup_keyword_crawler_tab()
         self._setup_warehouse_tab()
+        self._setup_giadinh_tab()
         self._setup_labeling_tab()
         self._setup_label_manager_tab()
         self._setup_file_manager_tab()
@@ -431,6 +434,18 @@ class App(ctk.CTk):
 
     def wh_download_drive(self):
         return _warehouse_tab.wh_download_drive(self)
+
+    # ---------------------------------------------------------
+    # TAB: GIA ĐÌNH (warehouse collocations + find/replace)
+    # ---------------------------------------------------------
+    def _setup_giadinh_tab(self):
+        return _giadinh_tab._setup_giadinh_tab(self)
+
+    def gd_scan(self):
+        return _giadinh_tab.gd_scan(self)
+
+    def gd_apply_replace(self):
+        return _giadinh_tab.gd_apply_replace(self)
 
     # ---------------------------------------------------------
     # TAB: AUTO LABELING (LM Studio)

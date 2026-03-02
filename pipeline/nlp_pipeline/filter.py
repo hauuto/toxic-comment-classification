@@ -29,7 +29,7 @@ from .config import (
 _ASCII_LETTERS = re.compile(r"[a-zA-Z]+")
 # Vietnamese-specific diacritical characters (quick check set from config)
 _PLACEHOLDER_RE = re.compile(
-    r"<(?:url|mention|hashtag|email|date|time|num|ip)>|:[a-z_]+:",
+    r"<(?:url|mention|hashtag|email|date|time|num|ip)>|:[a-z_]+:|@@[^\s@]{1,64}@@|@@+",
     re.IGNORECASE,
 )
 

@@ -43,7 +43,28 @@ _vncore_model_lock = threading.Lock()
 _vncore_model_cache: dict[str, Any] = {}
 
 
-def _get_or_create_vncorenlp_model(vncorenlp_dir: str, auto_download: bool) -> Any:
+_DEFAULT_VNCORE_HEAP = os.environ.get("VNCORENLP_MAX_HEAP", "-Xmx2g")
+
+_ann_env = os.environ.get("VNCORENLP_ANNOTATORS", "wseg")
+_DEFAULT_VNCORE_ANNOTATORS = [a.strip() for a in _ann_env.split(",") if a.strip()] or ["wseg"]
+
+def _default_max_input_chars() -> int:
+    # Defensive default: very long inputs can crash/kill the JVM.
+    raw = os.environ.get("VNCORENLP_MAX_INPUT_CHARS", "8000").strip()
+    try:
+        v = int(raw)
+        return v if v > 0 else 8000
+    except Exception:
+        return 8000
+
+
+def _get_or_create_vncorenlp_model(
+    vncorenlp_dir: str,
+    auto_download: bool,
+    *,
+    max_heap_size: str | None = None,
+    annotators: list[str] | None = None,
+) -> Any:
     """Return a cached py_vncorenlp.VnCoreNLP instance for *vncorenlp_dir*."""
     key = os.path.abspath(vncorenlp_dir)
     with _vncore_model_lock:
@@ -57,7 +78,14 @@ def _get_or_create_vncorenlp_model(vncorenlp_dir: str, auto_download: bool) -> A
             except Exception:
                 pass
 
-        model = py_vncorenlp.VnCoreNLP(save_dir=vncorenlp_dir)
+        heap = (max_heap_size or _DEFAULT_VNCORE_HEAP).strip() or _DEFAULT_VNCORE_HEAP
+        ann = annotators or _DEFAULT_VNCORE_ANNOTATORS
+        # Load only what's needed for segmentation to reduce RAM usage.
+        model = py_vncorenlp.VnCoreNLP(
+            max_heap_size=heap,
+            annotators=ann,
+            save_dir=vncorenlp_dir,
+        )
         _vncore_model_cache[key] = model
         return model
 
@@ -67,6 +95,7 @@ def _get_or_create_vncorenlp_model(vncorenlp_dir: str, auto_download: bool) -> A
 _PLACEHOLDER_RE = re.compile(
     r"<(?:url|mention|hashtag|email|date|time|num|ip)>|"
     r":[a-zA-Z0-9_àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]+:|"
+    r"@@[^\s@]{1,64}@@|@@+|"
     r"(?<!\w)[a-zA-Z]+['’][a-zA-Z]+(?!\w)",
     re.UNICODE | re.IGNORECASE,
 )
@@ -81,6 +110,10 @@ class WordSegmentor:
         vncorenlp_dir: Optional[str] = None,
         vncorenlp_model: Any = None,
         auto_download: bool = True,
+        *,
+        vncorenlp_max_heap: str | None = None,
+        vncorenlp_annotators: list[str] | None = None,
+        max_input_chars: int | None = None,
     ):
         """
         Args:
@@ -98,6 +131,11 @@ class WordSegmentor:
         self.vncorenlp_model = vncorenlp_model
         self._vncore_timeout_streak = 0   # consecutive timeouts; triggers fallback after 3
         self._vncore_dead = False          # set True when JVM is considered unresponsive
+        self._max_input_chars = max_input_chars if max_input_chars is not None else _default_max_input_chars()
+        self._warned_too_long = False
+
+        self._vncorenlp_max_heap = vncorenlp_max_heap
+        self._vncorenlp_annotators = vncorenlp_annotators
 
         # =========================================================
         # VNCORENLP BACKEND (BEST ACCURACY)
@@ -127,6 +165,8 @@ class WordSegmentor:
                     self.vncorenlp_model = _get_or_create_vncorenlp_model(
                         vncorenlp_dir=vncorenlp_dir,
                         auto_download=auto_download,
+                        max_heap_size=self._vncorenlp_max_heap,
+                        annotators=self._vncorenlp_annotators,
                     )
 
                     print(f"[WordSegmentor] Using py_vncorenlp at: {vncorenlp_dir}")
@@ -199,6 +239,16 @@ class WordSegmentor:
         """
 
         if not text or not text.strip():
+            return text
+
+        if self._max_input_chars is not None and len(text) > self._max_input_chars:
+            # Defensive: very long rows can crash/kill the JVM process.
+            if not self._warned_too_long:
+                print(
+                    f"[WordSegmentor] Skip VnCoreNLP segmentation for long text "
+                    f"(len>{self._max_input_chars}). Returning unsegmented text."
+                )
+                self._warned_too_long = True
             return text
 
         try:

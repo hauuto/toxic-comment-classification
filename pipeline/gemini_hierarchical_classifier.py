@@ -66,7 +66,7 @@ Return a list of sub-labels:
   - "Positive": positive, supportive, encouraging comments.
   - "Negative": negative, critical, complaining comments (but not toxic).
   - "Neutral": neutral, factual, or informational comments.
-Tier 3 can contain 0, 1, or multiple labels simultaneously.
+Tier 3 must contain at least 1 label.
 
 ### Output Format
 Reply with ONLY a JSON object with this exact shape:
@@ -76,6 +76,7 @@ Reply with ONLY a JSON object with this exact shape:
 ]}
 
 Return ONLY a valid JSON object. Do not include any explanations, markdown formatting, or backticks.
+Do NOT repeat, quote, or paraphrase the input comments in any way. Output ONLY the JSON object.
 
 General Rules:
 - Evaluate tiers independently but logically consistent.
@@ -150,6 +151,7 @@ class GeminiHierarchicalClassifier:
             "generationConfig": {
                 "temperature": 0.0,
                 "maxOutputTokens": 200,
+                "responseMimeType": "application/json",
             },
             "safetySettings": [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -161,6 +163,17 @@ class GeminiHierarchicalClassifier:
 
         try:
             r = requests.post(endpoint, json=payload, timeout=10)
+            # Some deployments reject responseMimeType; retry without it.
+            if r.status_code == 400:
+                try:
+                    body = (r.text or "")
+                except Exception:
+                    body = ""
+                if "responseMimeType" in body or "response_mime_type" in body:
+                    payload2 = dict(payload)
+                    payload2["generationConfig"] = dict(payload.get("generationConfig", {}))
+                    payload2["generationConfig"].pop("responseMimeType", None)
+                    r = requests.post(endpoint, json=payload2, timeout=10)
             r.raise_for_status()
             data = r.json()
             text = _get_gemini_text(data)
@@ -177,7 +190,15 @@ class GeminiHierarchicalClassifier:
     @staticmethod
     def _build_user_message(texts: List[str]) -> str:
         joined = "\n".join(f"Comment {i + 1}: {text}" for i, text in enumerate(texts))
-        return "Input comments:\n" + joined
+        n = len(texts)
+        return (
+            "Input comments:\n"
+            + joined
+            + f"\n\nTotal comments: {n}.\n"
+            + "Output must contain exactly Total comments items in the same order.\n"
+            + "Do NOT merge multiple comments into one item.\n"
+            + "If uncertain, still output a best-effort label for each comment."
+        )
 
     # ------------------------------------------------------------------
     # Predict
@@ -189,6 +210,44 @@ class GeminiHierarchicalClassifier:
         strict: bool = False,
         **kwargs,
     ) -> List[Dict[str, Any]]:
+        def _should_split_on_error(err: Exception) -> bool:
+            msg = str(err).lower()
+            return (
+                "length mismatch" in msg
+                or "parse mismatch" in msg
+                or "could not parse json" in msg
+                or "empty model output" in msg
+                or "non-json" in msg
+            )
+
+        def _should_fallback_single(err: Exception) -> bool:
+            msg = str(err).lower()
+            return "empty model output" in msg or "safety" in msg or isinstance(err, GeminiEmptyOutputError)
+
+        def _predict_strict_with_splitting(batch_tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            """Strict predict that auto-splits batches if Gemini returns wrong item count.
+
+            This avoids failing an entire batch when Gemini only labels the first comment.
+            """
+            try:
+                return _predict_once(batch_tasks)
+            except Exception as e:
+                if not strict:
+                    raise
+                if len(batch_tasks) <= 1:
+                    if _should_fallback_single(e):
+                        # Do not abort the whole run for a single safety-blocked/empty item.
+                        if isinstance(e, GeminiEmptyOutputError) and e.response_json is not None:
+                            return [_fallback_result_from_gemini_response(e.response_json)]
+                        return [_default_result()]
+                    raise
+                if not _should_split_on_error(e):
+                    raise
+                mid = len(batch_tasks) // 2
+                left = _predict_strict_with_splitting(batch_tasks[:mid])
+                right = _predict_strict_with_splitting(batch_tasks[mid:])
+                return left + right
+
         texts = [str(t.get("data", {}).get("text", "")) for t in tasks]
         user_msg = self._build_user_message(texts)
 
@@ -208,6 +267,9 @@ class GeminiHierarchicalClassifier:
                 "temperature": self.temperature,
                 # maxOutputTokens set per-attempt (scaled)
                 "maxOutputTokens": base_max_tokens,
+                # Ask Gemini to return JSON directly (reduces chances of markdown/explanations).
+                # If unsupported by a specific API version/model, we'll auto-fallback at runtime.
+                "responseMimeType": "application/json",
             },
             "safetySettings": [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -242,53 +304,92 @@ class GeminiHierarchicalClassifier:
         last_error: Exception | None = None
         last_response: requests.Response | None = None
         last_body_snippet: str = ""
+        allow_response_mime = True
         max_attempts = 1 + max(0, int(retries))
-        for attempt in range(max_attempts):
-            try:
-                # Scale tokens on each retry to avoid truncated JSON.
-                scaled_max_tokens = int(base_max_tokens * (1.8 ** attempt))
-                scaled_max_tokens = max(base_max_tokens, scaled_max_tokens)
-                scaled_max_tokens = min(scaled_max_tokens, 8192)
 
-                payload = dict(base_payload)
-                payload["generationConfig"] = dict(base_payload.get("generationConfig", {}))
-                payload["generationConfig"]["maxOutputTokens"] = scaled_max_tokens
+        def _predict_once(batch_tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            nonlocal last_error, last_response, last_body_snippet, allow_response_mime
 
-                r = self.session.post(self.endpoint, json=payload, timeout=self.timeout)
-                last_response = r
-                if r.status_code >= 400:
-                    # Retryable errors: rate-limit / transient server issues.
-                    if _is_retryable_http(int(r.status_code)) and attempt < (max_attempts - 1):
-                        time.sleep(_retry_sleep_seconds(attempt, r))
-                        continue
-                    try:
-                        last_body_snippet = (r.text or "")[:1200]
-                    except Exception:
-                        last_body_snippet = ""
-                    r.raise_for_status()
-
+            for attempt in range(max_attempts):
                 try:
-                    data = r.json()
+                    # Scale tokens on each retry to avoid truncated JSON.
+                    scaled_max_tokens = int(base_max_tokens * (1.8 ** attempt))
+                    scaled_max_tokens = max(base_max_tokens, scaled_max_tokens)
+                    scaled_max_tokens = min(scaled_max_tokens, 8192)
+
+                    payload = dict(base_payload)
+                    payload["generationConfig"] = dict(base_payload.get("generationConfig", {}))
+                    payload["generationConfig"]["maxOutputTokens"] = scaled_max_tokens
+
+                    if not allow_response_mime:
+                        payload.get("generationConfig", {}).pop("responseMimeType", None)
+
+                    r = self.session.post(self.endpoint, json=payload, timeout=self.timeout)
+                    last_response = r
+                    if r.status_code >= 400:
+                        # Some deployments reject unknown generationConfig keys; fall back if needed.
+                        if int(r.status_code) == 400 and allow_response_mime and attempt < (max_attempts - 1):
+                            try:
+                                body = (r.text or "")[:2000]
+                            except Exception:
+                                body = ""
+                            if "responseMimeType" in body or "response_mime_type" in body:
+                                allow_response_mime = False
+                                time.sleep(_retry_sleep_seconds(attempt, r))
+                                continue
+                        # Retryable errors: rate-limit / transient server issues.
+                        if _is_retryable_http(int(r.status_code)) and attempt < (max_attempts - 1):
+                            time.sleep(_retry_sleep_seconds(attempt, r))
+                            continue
+                        try:
+                            last_body_snippet = (r.text or "")[:1200]
+                        except Exception:
+                            last_body_snippet = ""
+                        r.raise_for_status()
+
+                    try:
+                        data = r.json()
+                    except Exception as e:
+                        last_body_snippet = (r.text or "")[:1200]
+                        raise RuntimeError(f"Gemini returned non-JSON response: {last_body_snippet}") from e
+
+                    # Safety-blocked or empty candidate output (HTTP 200 but no usable content).
+                    if not (data.get("candidates") or []):
+                        raise GeminiEmptyOutputError(
+                            "Empty model output (possibly safety-blocked or missing content)", response_json=data
+                        )
+
+                    text = _get_gemini_text(data)
+                    if not text.strip():
+                        raise GeminiEmptyOutputError(
+                            "Empty model output (possibly safety-blocked or missing content)", response_json=data
+                        )
+                    items = _parse_items(text, expected_n=len(batch_tasks), strict=strict)
+                    validated = [_validate_tier_result(obj) for obj in items]
+
+                    if len(validated) == len(batch_tasks):
+                        return validated
+
+                    # Parsed but shape mismatch → treat as retryable parsing failure.
+                    raise ValueError("Gemini output parse mismatch")
+
                 except Exception as e:
-                    last_body_snippet = (r.text or "")[:1200]
-                    raise RuntimeError(f"Gemini returned non-JSON response: {last_body_snippet}") from e
-                text = _get_gemini_text(data)
-                items = _parse_items(text, expected_n=len(tasks), strict=strict)
-                validated = [_validate_tier_result(obj) for obj in items]
+                    last_error = e
+                    # If we hit a retryable case (timeouts, connection issues, parse mismatch), backoff.
+                    if attempt < (max_attempts - 1):
+                        time.sleep(_retry_sleep_seconds(attempt, last_response))
+                        continue
+                    raise
 
-                if len(validated) == len(tasks):
-                    return validated
+            raise RuntimeError("Gemini request failed after retries")
 
-                # Parsed but shape mismatch → treat as retryable parsing failure.
-                raise ValueError("Gemini output parse mismatch")
-
-            except Exception as e:
-                last_error = e
-                # If we hit a retryable case (timeouts, connection issues, parse mismatch), backoff.
-                if attempt < (max_attempts - 1):
-                    time.sleep(_retry_sleep_seconds(attempt, last_response))
-                    continue
-                break
+        try:
+            # If strict mode is enabled, recover by splitting the batch when Gemini returns wrong count.
+            if strict and len(tasks) > 1:
+                return _predict_strict_with_splitting(tasks)
+            return _predict_once(tasks)
+        except Exception as e:
+            last_error = e
 
         if strict:
             status = None
@@ -310,16 +411,150 @@ class GeminiHierarchicalClassifier:
 
 
 def _get_gemini_text(result: Dict[str, Any]) -> str:
+    """Extract text from Gemini `generateContent` response.
+
+    Gemini may split the output across multiple `parts`. If we only read the
+    first part, JSON can be truncated even with HTTP 200.
+    """
     try:
-        return result["candidates"][0]["content"]["parts"][0]["text"]
+        candidates = result.get("candidates") or []
+        if not candidates:
+            return ""
+        content = candidates[0].get("content") or {}
+        parts = content.get("parts") or []
+        if not isinstance(parts, list) or not parts:
+            return ""
+        chunks: list[str] = []
+        for p in parts:
+            if isinstance(p, dict) and isinstance(p.get("text"), str):
+                chunks.append(p.get("text") or "")
+        return "".join(chunks)
     except Exception:
         return ""
+
+
+class GeminiEmptyOutputError(RuntimeError):
+    def __init__(self, message: str, response_json: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.response_json = response_json
+
+
+def _fallback_result_from_gemini_response(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort fallback when Gemini returns HTTP 200 but no output.
+
+    If promptFeedback/safetyRatings suggest a category, map to a reasonable toxic label.
+    Otherwise, return the global default.
+    """
+    try:
+        fb = resp.get("promptFeedback") or {}
+        ratings = fb.get("safetyRatings") or []
+        if not isinstance(ratings, list):
+            ratings = []
+
+        categories: list[str] = []
+        for r in ratings:
+            if isinstance(r, dict) and isinstance(r.get("category"), str):
+                categories.append(r.get("category") or "")
+
+        cats = " ".join(categories).upper()
+        if "HATE" in cats:
+            return {"tier1_spam": "Not Spam", "tier2_toxic": "Toxic", "tier3_labels": ["Hate Speech"]}
+        if "HARASS" in cats:
+            return {"tier1_spam": "Not Spam", "tier2_toxic": "Toxic", "tier3_labels": ["Harassment"]}
+        if "SEXU" in cats or "SEXUAL" in cats:
+            return {"tier1_spam": "Not Spam", "tier2_toxic": "Toxic", "tier3_labels": ["Obscene"]}
+        if "DANGEROUS" in cats:
+            return {"tier1_spam": "Not Spam", "tier2_toxic": "Toxic", "tier3_labels": ["Harassment"]}
+    except Exception:
+        return _default_result()
+
+    return _default_result()
 
 
 def _strip_code_fences(text: str) -> str:
     text = re.sub(r"```json\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"```\s*", "", text)
     return text.strip()
+
+
+def _balanced_json_substring(text: str, start_index: int) -> Optional[str]:
+    """Return a balanced JSON object/array substring starting at start_index.
+
+    Handles nested {}/[] and ignores braces inside JSON strings.
+    Returns None if the substring is not balanced (likely truncated).
+    """
+    if start_index < 0 or start_index >= len(text):
+        return None
+
+    start_ch = text[start_index]
+    if start_ch not in "{[":
+        return None
+
+    matching = {"{": "}", "[": "]"}
+    open_to_close = matching
+    close_to_open = {"}": "{", "]": "["}
+
+    stack: list[str] = []
+    in_string = False
+    escape = False
+
+    for i in range(start_index, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+
+        # not in string
+        if ch == '"':
+            in_string = True
+            continue
+
+        if ch in "{[":
+            stack.append(ch)
+            continue
+
+        if ch in "}]":
+            if not stack:
+                return None
+            expected_open = close_to_open.get(ch)
+            if expected_open != stack[-1]:
+                return None
+            stack.pop()
+            if not stack:
+                return text[start_index : i + 1]
+
+    return None
+
+
+def _iter_json_candidates(text: str) -> List[str]:
+    """Generate possible JSON payload substrings from a model output."""
+    if not text:
+        return []
+
+    # Primary candidate: whole text
+    candidates: list[str] = [text.strip()]
+
+    # Balanced substrings starting at every '{' or '['
+    seen: set[str] = set(candidates)
+    for i, ch in enumerate(text):
+        if ch not in "{[":
+            continue
+        sub = _balanced_json_substring(text, i)
+        if not sub:
+            continue
+        sub = sub.strip()
+        if sub and sub not in seen:
+            seen.add(sub)
+            candidates.append(sub)
+
+    return candidates
 
 
 def _extract_json_by_brackets(text: str, open_ch: str, close_ch: str) -> Optional[str]:
@@ -345,14 +580,26 @@ def _parse_items(content: str, expected_n: int, strict: bool = False) -> List[Di
 
     content = _strip_code_fences(content)
 
-    # 1) direct json
-    items = _try_parse_items_json(content)
-    if items is not None:
-        if strict and expected_n > 0 and len(items) != expected_n:
-            raise ValueError(f"Gemini parsed items length mismatch: expected {expected_n}, got {len(items)}")
-        return _pad_or_trim(items, expected_n) if not strict else items
+    # New robust strategy: try all balanced JSON candidates and prefer a candidate
+    # whose parsed length matches expected_n (helps when the model echoes schema/examples).
+    parsed_any: Optional[List[Dict[str, Any]]] = None
+    for cand in _iter_json_candidates(content):
+        items = _try_parse_items_json(cand)
+        if items is None:
+            continue
 
-    # 2) try extract {...}
+        if expected_n > 0 and len(items) == expected_n:
+            return items if strict else items
+
+        if parsed_any is None:
+            parsed_any = items
+
+    if parsed_any is not None:
+        if strict and expected_n > 0 and len(parsed_any) != expected_n:
+            raise ValueError(f"Gemini parsed items length mismatch: expected {expected_n}, got {len(parsed_any)}")
+        return _pad_or_trim(parsed_any, expected_n) if not strict else parsed_any
+
+    # Backward-compatible fallbacks (best-effort extraction by first/last brackets)
     obj_str = _extract_json_by_brackets(content, "{", "}")
     if obj_str:
         items = _try_parse_items_json(obj_str)
@@ -361,7 +608,6 @@ def _parse_items(content: str, expected_n: int, strict: bool = False) -> List[Di
                 raise ValueError(f"Gemini parsed items length mismatch: expected {expected_n}, got {len(items)}")
             return _pad_or_trim(items, expected_n) if not strict else items
 
-    # 3) try extract [...]
     arr_str = _extract_json_by_brackets(content, "[", "]")
     if arr_str:
         items = _try_parse_items_json(arr_str)

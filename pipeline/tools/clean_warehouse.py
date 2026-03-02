@@ -48,12 +48,17 @@ _GIA_DINH_BEFORE_TOKEN_RE = re.compile(
 # (conservative adjacency rule; does not remove 'gia đình' in normal sentences).
 _TAG_RE_STR = r"<\s*[A-Za-z0-9_]+\s*>"
 _GIA_DINH_WORD_RE_STR = r"gia(?:\s+|_)+đình"
+
+# Some stored texts contain separators like "%" between tokens (e.g. "<NUM>% gia đình").
+# Allow optional percent-separators while keeping the rule conservative (adjacent only).
+_TAG_ADJ_SEP_STR = r"(?:\s*%+\s*)?"
+
 _GIA_DINH_BEFORE_TAG_RE = re.compile(
-    rf"\s*{_GIA_DINH_WORD_RE_STR}\s*(?={_TAG_RE_STR})",
+    rf"\s*{_GIA_DINH_WORD_RE_STR}\s*{_TAG_ADJ_SEP_STR}(?={_TAG_RE_STR})",
     re.UNICODE | re.IGNORECASE,
 )
 _TAG_THEN_GIA_DINH_RE = re.compile(
-    rf"(?P<tag>{_TAG_RE_STR})\s*{_GIA_DINH_WORD_RE_STR}\s*",
+    rf"(?P<tag>{_TAG_RE_STR})\s*{_TAG_ADJ_SEP_STR}{_GIA_DINH_WORD_RE_STR}\s*",
     re.UNICODE | re.IGNORECASE,
 )
 
@@ -105,6 +110,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--path", default=str(_default_warehouse_path()), help="Path to warehouse.csv")
     parser.add_argument("--dry-run", action="store_true", help="Do not write changes; just report.")
+    parser.add_argument(
+        "--reid",
+        action="store_true",
+        help="Rewrite id column sequentially from 1..N while writing.",
+    )
     args = parser.parse_args(argv)
 
     src_path = Path(args.path)
@@ -127,6 +137,10 @@ def main(argv: list[str] | None = None) -> int:
             print("warehouse.csv has no header/fieldnames", file=sys.stderr)
             return 2
 
+        if args.reid and "id" not in [f.lower() for f in fieldnames]:
+            # Ensure we have an id column to rewrite.
+            fieldnames = ["id", *fieldnames]
+
         if args.dry_run:
             for row in reader:
                 total_rows += 1
@@ -134,6 +148,10 @@ def main(argv: list[str] | None = None) -> int:
                 cleaned, changed = clean_text(text)
                 if changed:
                     changed_rows += 1
+                if args.reid:
+                    # Resetting ids always changes semantic content; count it.
+                    # We don't attempt to compare old/new id values in dry-run.
+                    changed_rows += 0
                 if total_rows % 200000 == 0:
                     print(f"... scanned {total_rows:,} rows, changed {changed_rows:,}")
             print(f"DONE (dry-run). scanned={total_rows:,} changed={changed_rows:,}")
@@ -150,6 +168,9 @@ def main(argv: list[str] | None = None) -> int:
                 if changed:
                     changed_rows += 1
                     row["text"] = cleaned
+
+                if args.reid:
+                    row["id"] = str(total_rows)
 
                 writer.writerow(row)
 
